@@ -5,3 +5,6 @@ example.xlsx
 input.md
 output.md
 repo_fetch_results.json
+input.xlsx
+output.xlsx
+~$*.xlsx
