@@ -2,3 +2,6 @@ __pycache__/
 *.py[cod]
 .env
 example.xlsx
+input.md
+output.md
+repo_fetch_results.json
