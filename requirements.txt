@@ -3,3 +3,5 @@ uvicorn==0.34.2
 requests==2.32.3
 readability-lxml==0.8.4.1
 beautifulsoup4==4.13.4
+python-dotenv==1.0.1
+openai==1.79.0
