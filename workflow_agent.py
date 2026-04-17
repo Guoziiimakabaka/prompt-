@@ -1,8 +1,14 @@
 import argparse
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
+
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field, ValidationError
 
 from app import extract_page_content
 
@@ -28,24 +34,36 @@ class RepoResult:
     error: str
 
 
+class AgentDecision(BaseModel):
+    debug_prompt: str = Field(..., description="Debug prompt content.")
+    debug_rewrite_repo: str = Field(
+        ...,
+        description="Selected repo id for debug, e.g. repo3 or empty string.",
+    )
+    new_requirement_prompt: str = Field(
+        ...,
+        description="New requirement prompt content.",
+    )
+    new_requirement_rewrite_repo: str = Field(
+        ...,
+        description="Selected repo id for new requirement, e.g. repo7 or empty string.",
+    )
+    unable_to_add_requirement_note: str = Field(
+        ...,
+        description="Reason note when new requirement cannot be added.",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Parse input.md, fetch repo pages, and generate output.md."
+        description="LLM workflow agent: parse input.md, fetch repo pages, generate output.md."
     )
-    parser.add_argument(
-        "--input_md",
-        default="input.md",
-        help="Input markdown path.",
-    )
-    parser.add_argument(
-        "--output_md",
-        default="output.md",
-        help="Output markdown path.",
-    )
+    parser.add_argument("--input_md", default="input.md", help="Input markdown path.")
+    parser.add_argument("--output_md", default="output.md", help="Output markdown path.")
     parser.add_argument(
         "--fetch_json",
         default="repo_fetch_results.json",
-        help="Fetched repo debug JSON path.",
+        help="Fetched repo details path.",
     )
     return parser.parse_args()
 
@@ -122,7 +140,7 @@ def fetch_repos(data: ParsedInput) -> list[RepoResult]:
                 remark=remark,
                 ok=True,
                 title=extracted.get("title", ""),
-                text_preview=text[:220].replace("\n", " "),
+                text_preview=text[:300].replace("\n", " "),
                 text_length=int(extracted.get("text_length", 0)),
                 error="",
             )
@@ -142,107 +160,190 @@ def fetch_repos(data: ParsedInput) -> list[RepoResult]:
     return results
 
 
-def choose_debug_repo(results: list[RepoResult]) -> RepoResult | None:
-    with_remark = [
-        r for r in results if r.remark and r.score in (0, 1)
-    ]
-    if with_remark:
-        return with_remark[0]
-
-    score_zero = [r for r in results if r.score == 0]
-    if score_zero:
-        return score_zero[0]
-
-    score_one = [r for r in results if r.score == 1]
-    if score_one:
-        return score_one[0]
-    return None
-
-
-def choose_new_requirement_repo(results: list[RepoResult]) -> RepoResult | None:
-    score_two = [r for r in results if r.score == 2]
-    if score_two:
-        return score_two[0]
-    return None
-
-
-def build_debug_prompt(repo: RepoResult) -> str:
-    note = repo.remark if repo.remark else "存在交互或机制问题"
-    return (
-        f"请你帮我修复 `{repo.repo_id}` 这个版本。"
-        f"当前明显问题是：{note}。"
-        "请先定位根因，再完整修复。"
-        "修复时不要破坏已可用功能，修完后请你自测完整对局流程，"
-        "重点检查落子、boop 推挤、棋子回收和胜负判定。"
-    )
-
-
-def build_new_requirement_prompt(repo: RepoResult) -> str:
-    return (
-        f"请基于 `{repo.repo_id}` 只新增一个具体功能：`落子结果预览`。"
-        "不要改动 Boop 的核心规则（6x6 棋盘、kitten 推挤、三 kitten 升 cat、三 cat 获胜）。"
-        "功能细则："
-        "1) 当玩家鼠标悬停在可落子格时，实时高亮这一步会被 boop 推动的棋子；"
-        "2) 同时高亮这些棋子的目标落点；"
-        "3) 如果某棋子会被挤出棋盘，要明确标记“将被挤出”；"
-        "4) 玩家点击落子后，实际结果必须与预览一致。"
-        "验收标准：任意选一个可落子格，预览信息完整且与最终落子结果一致。"
-    )
-
-
-def build_unable_note(results: list[RepoResult], new_repo: RepoResult | None) -> str:
-    if new_repo is not None:
-        return "无。已完成新增需求 repo 选择。"
-
-    has_score_two = any(r.score == 2 for r in results)
-    if not has_score_two:
-        return "没有 2 分 case，无法新增需求。"
-
-    return "2 分 case 无法确认为可用状态，无法新增需求。"
-
-
 def write_fetch_json(path: Path, data: ParsedInput, results: list[RepoResult]) -> None:
     payload = {
         "base_prompt": data.base_prompt,
         "repo_urls": data.repo_urls,
         "scores": data.scores,
         "remarks": data.remarks,
-        "results": [
+        "results": [asdict(r) for r in results],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _repo_exists(repo_id: str, results: list[RepoResult]) -> bool:
+    return any(r.repo_id == repo_id for r in results)
+
+
+def _repo_by_id(repo_id: str, results: list[RepoResult]) -> RepoResult | None:
+    for r in results:
+        if r.repo_id == repo_id:
+            return r
+    return None
+
+
+def validate_and_fix_decision(
+    decision: AgentDecision,
+    results: list[RepoResult],
+) -> AgentDecision:
+    debug_repo = decision.debug_rewrite_repo.strip()
+    new_repo = decision.new_requirement_rewrite_repo.strip()
+
+    remark_candidates = [r for r in results if r.remark]
+    score01 = [r for r in results if r.score in (0, 1)]
+    score2 = [r for r in results if r.score == 2]
+
+    # Debug repo guardrail: prefer remark first, then 0/1.
+    if debug_repo and not _repo_exists(debug_repo, results):
+        debug_repo = ""
+    if debug_repo:
+        selected = _repo_by_id(debug_repo, results)
+        if selected is None:
+            debug_repo = ""
+        else:
+            if selected.remark == "" and remark_candidates:
+                debug_repo = remark_candidates[0].repo_id
+            elif selected.score not in (0, 1) and score01:
+                debug_repo = score01[0].repo_id
+    else:
+        if remark_candidates:
+            debug_repo = remark_candidates[0].repo_id
+        elif score01:
+            debug_repo = score01[0].repo_id
+
+    # New requirement guardrail: must be score=2 and exactly one repo.
+    if new_repo and not _repo_exists(new_repo, results):
+        new_repo = ""
+    if new_repo:
+        selected = _repo_by_id(new_repo, results)
+        if selected is None or selected.score != 2:
+            new_repo = score2[0].repo_id if score2 else ""
+    else:
+        new_repo = score2[0].repo_id if score2 else ""
+
+    debug_prompt = decision.debug_prompt.strip()
+    if not debug_prompt:
+        if debug_repo:
+            note = _repo_by_id(debug_repo, results).remark if _repo_by_id(debug_repo, results) else "存在问题"
+            debug_prompt = (
+                f"请修复 `{debug_repo}`，当前问题：{note}。"
+                "请定位根因并修复，不要影响已有可用功能。"
+            )
+        else:
+            debug_prompt = "7 个产物都很优秀，无法写 debug"
+
+    new_prompt = decision.new_requirement_prompt.strip()
+    unable_note = decision.unable_to_add_requirement_note.strip()
+    if new_repo:
+        if not new_prompt:
+            new_prompt = (
+                f"请基于 `{new_repo}` 新增一个具体功能：落子结果预览。"
+                "要求：悬停可落子格时显示会被推动的棋子及目标位置，若将被挤出棋盘需明确标记，"
+                "且点击落子后的实际结果必须和预览一致。"
+            )
+        unable_note = "无。已完成新增需求 repo 选择。"
+    else:
+        new_prompt = ""
+        if not unable_note:
+            unable_note = "没有可用的 2 分 case，无法新增需求。"
+
+    return AgentDecision(
+        debug_prompt=debug_prompt,
+        debug_rewrite_repo=debug_repo,
+        new_requirement_prompt=new_prompt,
+        new_requirement_rewrite_repo=new_repo,
+        unable_to_add_requirement_note=unable_note,
+    )
+
+
+def build_llm_input(parsed: ParsedInput, results: list[RepoResult]) -> str:
+    cases: list[dict[str, Any]] = []
+    for r in results:
+        cases.append(
             {
-                "repo": r.repo_id,
+                "repo_id": r.repo_id,
                 "url": r.url,
                 "score": r.score,
                 "remark": r.remark,
-                "ok": r.ok,
+                "fetch_ok": r.ok,
                 "title": r.title,
                 "text_preview": r.text_preview,
                 "text_length": r.text_length,
                 "error": r.error,
             }
-            for r in results
-        ],
+        )
+
+    payload = {
+        "base_prompt": parsed.base_prompt,
+        "rules": {
+            "debug_select_priority": "优先选择有具体remark的repo；若无remark，再选0分；再选1分；debug只选1个repo",
+            "new_requirement_select": "优先选择2分repo；新增需求只选1个repo",
+            "new_requirement_prompt": "必须是单一具体功能，不能笼统描述",
+        },
+        "cases": cases,
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def write_output_md(
-    path: Path,
-    debug_repo: RepoResult | None,
-    new_repo: RepoResult | None,
-    debug_prompt: str,
-    new_prompt: str,
-    unable_note: str,
-) -> None:
-    debug_repo_id = debug_repo.repo_id if debug_repo else ""
-    new_repo_id = new_repo.repo_id if new_repo else ""
+def call_llm(parsed: ParsedInput, results: list[RepoResult]) -> AgentDecision:
+    load_dotenv()
+    import os
 
+    base_url = os.getenv("MODEL_BASE_URL")
+    api_key = os.getenv("MODEL_API_KEY")
+    model_name = os.getenv("MODEL_NAME")
+    if not base_url or not api_key or not model_name:
+        raise ValueError("MODEL_BASE_URL / MODEL_API_KEY / MODEL_NAME must be set in .env")
+
+    llm = ChatOpenAI(
+        model=model_name,
+        temperature=0.2,
+        api_key=api_key,
+        base_url=base_url,
+    )
+
+    system_prompt = (
+        "你是一个用于生成质检prompt的工程Agent。"
+        "你必须基于输入case信息输出严格JSON。"
+        "新增需求prompt必须是一个明确的单一功能，不允许笼统描述。"
+        "debug和新增需求各只选一个repo。"
+        "你输出的JSON必须包含以下键："
+        "debug_prompt,debug_rewrite_repo,new_requirement_prompt,new_requirement_rewrite_repo,unable_to_add_requirement_note"
+    )
+    human_prompt = (
+        "请根据以下输入生成结果JSON，不要输出任何解释。\n"
+        f"{build_llm_input(parsed, results)}"
+    )
+    messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+    response = llm.invoke(messages)
+    content = str(response.content).strip()
+
+    # Handle optional markdown code fence.
+    fence_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", content)
+    if fence_match:
+        content = fence_match.group(1)
+
+    try:
+        raw = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LLM did not return valid JSON: {content}") from exc
+
+    try:
+        parsed_decision = AgentDecision.model_validate(raw)
+    except ValidationError as exc:
+        raise ValueError(f"LLM output schema invalid: {raw}") from exc
+
+    return validate_and_fix_decision(parsed_decision, results)
+
+
+def write_output_md(path: Path, decision: AgentDecision) -> None:
     content = (
         "# 输出结果\n"
-        f"debug prompt:\n{debug_prompt}\n\n"
-        f"debug改写repo:\n{debug_repo_id}\n\n"
-        f"新增需求prompt:\n{new_prompt}\n\n"
-        f"新增需求改写repo:\n{new_repo_id}\n\n"
-        f"无法新增需求备注:\n{unable_note}\n"
+        f"debug prompt:\n{decision.debug_prompt}\n\n"
+        f"debug改写repo:\n{decision.debug_rewrite_repo}\n\n"
+        f"新增需求prompt:\n{decision.new_requirement_prompt}\n\n"
+        f"新增需求改写repo:\n{decision.new_requirement_rewrite_repo}\n\n"
+        f"无法新增需求备注:\n{decision.unable_to_add_requirement_note}\n"
     )
     path.write_text(content, encoding="utf-8")
 
@@ -257,29 +358,9 @@ def main() -> None:
     results = fetch_repos(parsed)
     write_fetch_json(fetch_path, parsed, results)
 
-    debug_repo = choose_debug_repo(results)
-    new_repo = choose_new_requirement_repo(results)
+    decision = call_llm(parsed, results)
+    write_output_md(output_path, decision)
 
-    if debug_repo is None:
-        debug_prompt = "7 个产物都很优秀，无法写 debug"
-    else:
-        debug_prompt = build_debug_prompt(debug_repo)
-
-    if new_repo is None:
-        new_prompt = ""
-    else:
-        new_prompt = build_new_requirement_prompt(new_repo)
-
-    unable_note = build_unable_note(results, new_repo)
-
-    write_output_md(
-        output_path,
-        debug_repo,
-        new_repo,
-        debug_prompt,
-        new_prompt,
-        unable_note,
-    )
     print(f"Generated: {output_path}")
     print(f"Fetched: {fetch_path}")
 
