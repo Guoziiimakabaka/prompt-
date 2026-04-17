@@ -1,10 +1,12 @@
 import argparse
+import hashlib
 import json
 import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -16,22 +18,22 @@ from pydantic import BaseModel, Field
 from app import extract_page_content
 
 
-INPUT_HEADERS = {
-    "uid",
-    "prompt",
-    "repo",
-    "评分",
-    "产物备注（参考）",
+INPUT_HEADER_ALIASES: dict[str, list[str]] = {
+    "uid": ["uid"],
+    "prompt": ["prompt"],
+    "repo": ["repo"],
+    "scores": ["评分", "打分", "score"],
+    "remarks": ["产物备注（参考）", "产物备注(参考)", "备注", "remark"],
 }
 
-OUTPUT_HEADERS = [
-    "debug prompt",
-    "debug 改写repo",
-    "无法写debug改写备注",
-    "新增需求 prompt",
-    "新增需求改写 repo",
-    "无法新增需求备注",
-]
+OUTPUT_COLUMNS: dict[str, str] = {
+    "debug_prompt": "debug prompt",
+    "debug_repo": "debug 改写repo",
+    "debug_unable_note": "无法写debug改写备注",
+    "new_prompt": "新增需求 prompt",
+    "new_repo": "新增需求改写 repo",
+    "new_unable_note": "无法新增需求备注",
+}
 
 DEBUG_UNABLE_TEXT = "7 个产物都很优秀，无法写 debug"
 
@@ -64,6 +66,10 @@ class RuntimeCheck:
     checked: bool
     passed: bool
     issues: list[str]
+    behavior_checked: bool
+    behavior_passed: bool
+    behavior_issues: list[str]
+    behavior_evidence: list[dict[str, Any]]
 
 
 @dataclass
@@ -84,8 +90,8 @@ class AgentDecision(BaseModel):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read cases from input.xlsx, fetch 7 repos per case, "
-            "run runtime checks, generate prompts, and write back into Excel."
+            "Read rows from Excel, run fetch + behavior-driven runtime validation, "
+            "generate prompts, and write results back to Excel."
         )
     )
     parser.add_argument("--input_xlsx", default="input.xlsx", help="Input Excel path.")
@@ -97,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sheet_name",
         default="",
-        help="Sheet name to process. Empty means the first sheet.",
+        help="Sheet name to process. Empty means first sheet.",
     )
     parser.add_argument(
         "--start_row",
@@ -109,25 +115,30 @@ def parse_args() -> argparse.Namespace:
         "--max_rows",
         type=int,
         default=0,
-        help="Max data rows to process. 0 means no limit.",
+        help="Max rows to process. 0 means no limit.",
     )
     parser.add_argument(
         "--uid",
         default="",
-        help="Only process the row whose uid matches this value.",
+        help="Only process rows whose uid exactly matches.",
     )
     parser.add_argument(
         "--fetch_json",
         default="repo_fetch_results.json",
-        help="Write fetched/runtime details to this JSON file.",
+        help="Output JSON path for fetch/runtime details.",
     )
     return parser.parse_args()
 
 
 def _to_text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
+    return "" if value is None else str(value).strip()
+
+
+def _normalize_header(text: str) -> str:
+    cleaned = _to_text(text)
+    cleaned = cleaned.replace("（", "(").replace("）", ")")
+    cleaned = re.sub(r"\s+", "", cleaned)
+    return cleaned.lower()
 
 
 def _require_env(name: str) -> str:
@@ -137,7 +148,7 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _header_map(ws: Worksheet) -> dict[str, int]:
+def _raw_header_map(ws: Worksheet) -> dict[str, int]:
     mapping: dict[str, int] = {}
     for col in range(1, ws.max_column + 1):
         header = _to_text(ws.cell(row=1, column=col).value)
@@ -146,42 +157,55 @@ def _header_map(ws: Worksheet) -> dict[str, int]:
     return mapping
 
 
-def _ensure_output_headers(ws: Worksheet, mapping: dict[str, int]) -> dict[str, int]:
-    next_col = ws.max_column + 1
-    for header in OUTPUT_HEADERS:
-        if header not in mapping:
-            ws.cell(row=1, column=next_col).value = header
-            mapping[header] = next_col
-            next_col += 1
-    return mapping
-
-
-def _assert_input_headers(mapping: dict[str, int]) -> None:
-    missing = [header for header in INPUT_HEADERS if header not in mapping]
+def _resolve_input_columns(raw_map: dict[str, int]) -> dict[str, int]:
+    normalized_to_col = {_normalize_header(k): v for k, v in raw_map.items()}
+    resolved: dict[str, int] = {}
+    for key, aliases in INPUT_HEADER_ALIASES.items():
+        for alias in aliases:
+            norm = _normalize_header(alias)
+            if norm in normalized_to_col:
+                resolved[key] = normalized_to_col[norm]
+                break
+    missing = [k for k in INPUT_HEADER_ALIASES if k not in resolved]
     if missing:
-        raise ValueError(f"Missing required headers in Excel: {missing}")
+        raise ValueError(f"Missing required input columns: {missing}")
+    return resolved
+
+
+def _ensure_output_columns(ws: Worksheet, raw_map: dict[str, int]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    next_col = ws.max_column + 1
+    normalized_to_col = {_normalize_header(k): v for k, v in raw_map.items()}
+    for key, header in OUTPUT_COLUMNS.items():
+        norm = _normalize_header(header)
+        if norm in normalized_to_col:
+            result[key] = normalized_to_col[norm]
+        else:
+            ws.cell(row=1, column=next_col).value = header
+            result[key] = next_col
+            next_col += 1
+    return result
 
 
 def _parse_json_list(raw: str, field_name: str) -> list[Any]:
     try:
-        value = json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"{field_name} is not valid JSON list: {raw}") from exc
-    if not isinstance(value, list):
+        raise ValueError(f"{field_name} must be valid JSON list: {raw}") from exc
+    if not isinstance(parsed, list):
         raise ValueError(f"{field_name} must be a JSON list")
-    return value
+    return parsed
 
 
 def _parse_urls(raw: str) -> list[str]:
     values = _parse_json_list(raw, "repo")
     if len(values) != 7:
         raise ValueError("repo URL list must contain exactly 7 URLs")
-
     urls: list[str] = []
-    for v in values:
-        text = _to_text(v)
+    for value in values:
+        text = _to_text(value)
         if not text.startswith("http"):
-            raise ValueError(f"Invalid repo URL: {text}")
+            raise ValueError(f"Invalid URL in repo list: {text}")
         urls.append(text)
     return urls
 
@@ -190,61 +214,61 @@ def _parse_scores(raw: str) -> list[int]:
     values = _parse_json_list(raw, "评分")
     if len(values) != 7:
         raise ValueError("评分 list must contain exactly 7 items")
-
     scores: list[int] = []
-    for v in values:
-        value = int(_to_text(v))
-        if value not in {0, 1, 2}:
-            raise ValueError(f"评分 item must be 0/1/2, got: {value}")
-        scores.append(value)
+    for value in values:
+        score = int(_to_text(value))
+        if score not in {0, 1, 2}:
+            raise ValueError(f"评分 must contain only 0/1/2, got: {score}")
+        scores.append(score)
     return scores
 
 
 def _parse_remarks(raw: str) -> dict[int, str]:
     if not raw:
         return {}
-
     normalized = raw.replace("；", "\n").replace(";", "\n")
     remarks: dict[int, str] = {}
     for line in normalized.splitlines():
         text = line.strip()
         if not text:
             continue
-        match = re.match(r"repo\s*([1-7])\s*[：:]\s*(.*)$", text, re.I)
-        if not match:
-            continue
-        idx = int(match.group(1))
-        note = match.group(2).strip()
-        if note:
-            remarks[idx] = note
+        match = re.match(r"repo\s*([1-7])\s*[:：]\s*(.*)$", text, re.IGNORECASE)
+        if match:
+            index = int(match.group(1))
+            note = match.group(2).strip()
+            if note:
+                remarks[index] = note
     return remarks
 
 
-def parse_row_input(ws: Worksheet, row_idx: int, mapping: dict[str, int]) -> ParsedInput | None:
-    uid = _to_text(ws.cell(row=row_idx, column=mapping["uid"]).value)
-    prompt = _to_text(ws.cell(row=row_idx, column=mapping["prompt"]).value)
-    repo_raw = _to_text(ws.cell(row=row_idx, column=mapping["repo"]).value)
-    score_raw = _to_text(ws.cell(row=row_idx, column=mapping["评分"]).value)
-    remark_raw = _to_text(ws.cell(row=row_idx, column=mapping["产物备注（参考）"]).value)
+def parse_row_input(
+    ws: Worksheet,
+    row_idx: int,
+    columns: dict[str, int],
+) -> ParsedInput | None:
+    uid = _to_text(ws.cell(row=row_idx, column=columns["uid"]).value)
+    prompt = _to_text(ws.cell(row=row_idx, column=columns["prompt"]).value)
+    repo_raw = _to_text(ws.cell(row=row_idx, column=columns["repo"]).value)
+    scores_raw = _to_text(ws.cell(row=row_idx, column=columns["scores"]).value)
+    remarks_raw = _to_text(ws.cell(row=row_idx, column=columns["remarks"]).value)
 
-    if not uid and not prompt and not repo_raw and not score_raw:
+    if not uid and not prompt and not repo_raw and not scores_raw:
         return None
-
     if not uid:
         raise ValueError(f"Row {row_idx}: uid is empty")
     if not prompt:
         raise ValueError(f"Row {row_idx}: prompt is empty")
     if not repo_raw:
         raise ValueError(f"Row {row_idx}: repo is empty")
-    if not score_raw:
+    if not scores_raw:
         raise ValueError(f"Row {row_idx}: 评分 is empty")
 
     return ParsedInput(
         uid=uid,
         base_prompt=prompt,
         repo_urls=_parse_urls(repo_raw),
-        scores=_parse_scores(score_raw),
-        remarks=_parse_remarks(remark_raw),
+        scores=_parse_scores(scores_raw),
+        remarks=_parse_remarks(remarks_raw),
     )
 
 
@@ -253,6 +277,11 @@ def _repo_by_id(repo_id: str, results: list[RepoResult]) -> RepoResult | None:
         if result.repo_id == repo_id:
             return result
     return None
+
+
+def _is_meaningful_remark(text: str) -> bool:
+    cleaned = text.strip().lower()
+    return cleaned not in {"", "无", "none", "n/a", "na"}
 
 
 def fetch_repos(data: ParsedInput) -> list[RepoResult]:
@@ -272,7 +301,7 @@ def fetch_repos(data: ParsedInput) -> list[RepoResult]:
                     remark=remark,
                     ok=True,
                     title=_to_text(extracted.get("title", "")),
-                    text_preview=text[:300].replace("\n", " "),
+                    text_preview=text[:500].replace("\n", " "),
                     text_length=int(extracted.get("text_length", 0)),
                     error="",
                 )
@@ -294,29 +323,272 @@ def fetch_repos(data: ParsedInput) -> list[RepoResult]:
     return results
 
 
-def run_runtime_check(repo_id: str, url: str) -> RuntimeCheck:
+def _install_mutation_observer(page: Any) -> None:
+    page.add_init_script(
+        """
+        () => {
+          window.__qaMutationCount = 0;
+          const observer = new MutationObserver((records) => {
+            window.__qaMutationCount += records.length;
+          });
+          observer.observe(document, {
+            subtree: true,
+            childList: true,
+            attributes: true,
+            characterData: true
+          });
+        }
+        """
+    )
+
+
+def _dom_snapshot(page: Any) -> tuple[str, int, int]:
+    payload = page.evaluate(
+        """
+        () => {
+          const body = document.body;
+          const text = body ? (body.innerText || '').slice(0, 8000) : '';
+          const html = body ? (body.innerHTML || '').slice(0, 16000) : '';
+          const mutation = Number(window.__qaMutationCount || 0);
+          const interactive = document.querySelectorAll(
+            "button, [role='button'], input, select, textarea, a, [onclick]"
+          ).length;
+          return { text, html, mutation, interactive };
+        }
+        """
+    )
+    seed = f"{payload['text']}||{payload['html']}"
+    digest = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()
+    return digest, int(payload["mutation"]), int(payload["interactive"])
+
+
+def _element_meta(element: Any) -> dict[str, str]:
+    return element.evaluate(
+        """
+        (el) => ({
+          tag: (el.tagName || '').toLowerCase(),
+          id: el.id || '',
+          cls: (el.className || '').toString().slice(0, 120),
+          text: ((el.innerText || el.value || '').trim()).slice(0, 40),
+          href: el.getAttribute ? (el.getAttribute('href') || '') : ''
+        })
+        """
+    )
+
+
+def _same_origin(url: str, href: str) -> bool:
+    if not href:
+        return True
+    if href.startswith("#") or href.startswith("javascript:"):
+        return True
+    if href.startswith("/"):
+        return True
+    if not href.startswith("http"):
+        return True
+    return urlparse(url).netloc == urlparse(href).netloc
+
+
+def _collect_click_candidates(page: Any, current_url: str) -> list[Any]:
+    selector = (
+        "button, [role='button'], input[type='button'], input[type='submit'], "
+        "a, [onclick], [data-testid*='cell'], [class*='cell'], [class*='tile'], "
+        "[class*='square'], [role='gridcell']"
+    )
+    elements = page.query_selector_all(selector)
+    candidates: list[Any] = []
+    for element in elements:
+        try:
+            if not element.is_visible():
+                continue
+            if not element.is_enabled():
+                continue
+            meta = _element_meta(element)
+            if meta["tag"] == "a" and not _same_origin(current_url, meta["href"]):
+                continue
+            if not meta["text"] and not meta["id"] and not meta["cls"]:
+                continue
+            candidates.append(element)
+            if len(candidates) >= 24:
+                break
+        except Exception:
+            continue
+    return candidates
+
+
+def _run_generic_interaction_probe(page: Any, current_url: str) -> tuple[list[str], dict[str, Any]]:
+    issues: list[str] = []
+    evidence: dict[str, Any] = {
+        "probe": "generic_interaction",
+        "attempts": 0,
+        "state_changes": 0,
+        "clicked": [],
+    }
+    candidates = _collect_click_candidates(page, current_url)
+    if not candidates:
+        issues.append("未发现可交互控件，页面缺少可验证行为。")
+        return issues, evidence
+
+    baseline_sig, baseline_mutation, _ = _dom_snapshot(page)
+    for element in candidates[:8]:
+        evidence["attempts"] += 1
+        try:
+            meta = _element_meta(element)
+            element.scroll_into_view_if_needed(timeout=1200)
+            element.click(timeout=1800)
+            page.wait_for_timeout(250)
+            now_sig, now_mutation, _ = _dom_snapshot(page)
+            changed = now_sig != baseline_sig or now_mutation > baseline_mutation
+            evidence["clicked"].append(
+                {
+                    "tag": meta["tag"],
+                    "text": meta["text"],
+                    "id": meta["id"],
+                    "changed": changed,
+                }
+            )
+            if changed:
+                evidence["state_changes"] += 1
+                baseline_sig = now_sig
+                baseline_mutation = now_mutation
+        except Exception as exc:
+            evidence["clicked"].append({"error": str(exc)[:160], "changed": False})
+
+    if evidence["state_changes"] == 0:
+        issues.append("执行多次真实点击后页面状态无变化，疑似交互逻辑未生效。")
+    return issues, evidence
+
+
+def _run_form_probe(page: Any) -> tuple[list[str], dict[str, Any]]:
+    issues: list[str] = []
+    evidence: dict[str, Any] = {"probe": "form_input", "input_changed": False}
+    try:
+        target = page.query_selector(
+            "input[type='text'], input:not([type]), textarea, input[type='search']"
+        )
+        if target and target.is_visible() and target.is_enabled():
+            target.fill("qa-behavior-probe")
+            page.wait_for_timeout(120)
+            value = target.input_value()
+            evidence["value"] = value
+            evidence["input_changed"] = "qa-behavior-probe" in value
+            if not evidence["input_changed"]:
+                issues.append("输入控件填充后值未变化，疑似表单输入链路异常。")
+        else:
+            evidence["skipped"] = True
+    except Exception as exc:
+        issues.append(f"表单探测执行异常：{exc}")
+    return issues, evidence
+
+
+def _is_board_like_prompt(base_prompt: str) -> bool:
+    return bool(
+        re.search(
+            r"boop|kitten|kittens|cats|board|6x6|棋盘|落子|回合|胜负",
+            base_prompt,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _collect_board_cells(page: Any) -> list[Any]:
+    selector = (
+        "[data-cell], [data-testid*='cell'], [class*='cell'], [class*='tile'], "
+        "[class*='square'], [role='gridcell'], td"
+    )
+    elements = page.query_selector_all(selector)
+    cells: list[Any] = []
+    for element in elements:
+        try:
+            if not element.is_visible():
+                continue
+            if not element.is_enabled():
+                continue
+            box = element.bounding_box()
+            if not box:
+                continue
+            area = box["width"] * box["height"]
+            if area < 80 or area > 70000:
+                continue
+            cells.append(element)
+            if len(cells) >= 40:
+                break
+        except Exception:
+            continue
+    return cells
+
+
+def _run_board_probe(page: Any, base_prompt: str) -> tuple[list[str], dict[str, Any]]:
+    issues: list[str] = []
+    evidence: dict[str, Any] = {
+        "probe": "board_interaction",
+        "attempts": 0,
+        "state_changes": 0,
+        "cell_count": 0,
+    }
+    if not _is_board_like_prompt(base_prompt):
+        evidence["skipped"] = True
+        return issues, evidence
+
+    cells = _collect_board_cells(page)
+    evidence["cell_count"] = len(cells)
+    if len(cells) < 9:
+        issues.append("页面疑似棋盘类场景，但未识别到足够棋盘单元。")
+        return issues, evidence
+
+    baseline_sig, baseline_mutation, _ = _dom_snapshot(page)
+    for cell in cells[:12]:
+        evidence["attempts"] += 1
+        try:
+            cell.scroll_into_view_if_needed(timeout=1000)
+            cell.click(timeout=1500)
+            page.wait_for_timeout(220)
+            now_sig, now_mutation, _ = _dom_snapshot(page)
+            changed = now_sig != baseline_sig or now_mutation > baseline_mutation
+            if changed:
+                evidence["state_changes"] += 1
+                baseline_sig = now_sig
+                baseline_mutation = now_mutation
+                if evidence["state_changes"] >= 2:
+                    break
+        except Exception:
+            continue
+
+    if evidence["state_changes"] == 0:
+        issues.append("棋盘候选单元多次点击后未观察到状态变化，疑似落子逻辑未生效。")
+    return issues, evidence
+
+
+def run_runtime_check(repo_id: str, url: str, base_prompt: str) -> RuntimeCheck:
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
+        missing = f"运行检查不可用：未安装 Playwright。{exc}"
         return RuntimeCheck(
             repo_id=repo_id,
             checked=False,
             passed=False,
-            issues=[f"运行检查不可用：未安装 Playwright。{exc}"],
+            issues=[missing],
+            behavior_checked=False,
+            behavior_passed=False,
+            behavior_issues=[missing],
+            behavior_evidence=[],
         )
 
     page_errors: list[str] = []
     console_errors: list[str] = []
     failed_requests: list[str] = []
-    issues: list[str] = []
+    health_issues: list[str] = []
+    behavior_issues: list[str] = []
+    behavior_evidence: list[dict[str, Any]] = []
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(ignore_https_errors=True)
             page = context.new_page()
+            _install_mutation_observer(page)
 
-            page.on("pageerror", lambda e: page_errors.append(str(e)))
+            page.on("pageerror", lambda exc: page_errors.append(str(exc)))
             page.on(
                 "console",
                 lambda msg: console_errors.append(msg.text)
@@ -325,48 +597,74 @@ def run_runtime_check(repo_id: str, url: str) -> RuntimeCheck:
             )
             page.on("requestfailed", lambda req: failed_requests.append(req.url))
 
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.goto(url, wait_until="networkidle", timeout=35000)
+            page.wait_for_timeout(350)
+
             root_rendered = page.evaluate(
                 """
                 () => {
                   const root = document.querySelector('#root');
                   if (!root) return false;
-                  const text = (root.textContent || '').trim();
-                  return root.childElementCount > 0 || text.length > 0;
+                  return (
+                    root.childElementCount > 0 ||
+                    (root.textContent || '').trim().length > 0
+                  );
                 }
                 """
             )
             body_text = page.inner_text("body")
-            text_len = len((body_text or "").strip())
+            body_len = len((body_text or "").strip())
 
-            if not root_rendered and text_len < 20:
-                issues.append("页面运行后接近空白，疑似渲染失败。")
+            if not root_rendered and body_len < 30:
+                health_issues.append("页面运行后接近空白，疑似渲染失败。")
             if page_errors:
-                issues.append(f"捕获到页面脚本异常 {len(page_errors)} 条。")
+                health_issues.append(f"捕获到页面脚本异常 {len(page_errors)} 条。")
             if console_errors:
-                issues.append(f"捕获到控制台错误 {len(console_errors)} 条。")
+                health_issues.append(f"捕获到控制台错误 {len(console_errors)} 条。")
             if len(failed_requests) >= 3:
-                issues.append(f"捕获到网络请求失败 {len(failed_requests)} 条。")
+                health_issues.append(f"捕获到网络请求失败 {len(failed_requests)} 条。")
+
+            generic_issues, generic_evidence = _run_generic_interaction_probe(page, url)
+            behavior_issues.extend(generic_issues)
+            behavior_evidence.append(generic_evidence)
+
+            form_issues, form_evidence = _run_form_probe(page)
+            behavior_issues.extend(form_issues)
+            behavior_evidence.append(form_evidence)
+
+            board_issues, board_evidence = _run_board_probe(page, base_prompt)
+            behavior_issues.extend(board_issues)
+            behavior_evidence.append(board_evidence)
 
             context.close()
             browser.close()
     except Exception as exc:
+        err = f"运行检查执行失败：{exc}"
         return RuntimeCheck(
             repo_id=repo_id,
             checked=False,
             passed=False,
-            issues=[f"运行检查执行失败：{exc}"],
+            issues=[err],
+            behavior_checked=False,
+            behavior_passed=False,
+            behavior_issues=[err],
+            behavior_evidence=behavior_evidence,
         )
 
+    all_issues = health_issues + behavior_issues
     return RuntimeCheck(
         repo_id=repo_id,
         checked=True,
-        passed=not issues,
-        issues=issues,
+        passed=not all_issues,
+        issues=all_issues,
+        behavior_checked=True,
+        behavior_passed=not behavior_issues,
+        behavior_issues=behavior_issues,
+        behavior_evidence=behavior_evidence,
     )
 
 
-def build_analysis(results: list[RepoResult]) -> AnalysisBundle:
+def build_analysis(results: list[RepoResult], base_prompt: str) -> AnalysisBundle:
     repo_issues: dict[str, list[str]] = {}
     global_issues: list[str] = []
     runtime_checks: dict[str, RuntimeCheck] = {}
@@ -374,6 +672,7 @@ def build_analysis(results: list[RepoResult]) -> AnalysisBundle:
     failed_fetch: list[str] = []
     default_title: list[str] = []
     empty_text: list[str] = []
+    behavior_failed: list[str] = []
 
     for result in results:
         issues: list[str] = []
@@ -385,12 +684,14 @@ def build_analysis(results: list[RepoResult]) -> AnalysisBundle:
             issues.append("页面标题疑似默认模板。")
         if result.text_length == 0:
             empty_text.append(result.repo_id)
-            issues.append("未提取到正文文本。")
+            issues.append("正文提取为空，可能依赖前端渲染。")
 
-        runtime = run_runtime_check(result.repo_id, result.url)
+        runtime = run_runtime_check(result.repo_id, result.url, base_prompt)
         runtime_checks[result.repo_id] = runtime
         if not runtime.passed:
             issues.extend(runtime.issues)
+        if runtime.checked and not runtime.behavior_passed:
+            behavior_failed.append(result.repo_id)
 
         if issues:
             repo_issues[result.repo_id] = issues
@@ -401,6 +702,8 @@ def build_analysis(results: list[RepoResult]) -> AnalysisBundle:
         global_issues.append(f"默认标题页面：{', '.join(default_title)}。")
     if empty_text:
         global_issues.append(f"正文为空页面：{', '.join(empty_text)}。")
+    if behavior_failed:
+        global_issues.append(f"行为验证未通过页面：{', '.join(behavior_failed)}。")
 
     return AnalysisBundle(
         repo_issues=repo_issues,
@@ -410,7 +713,7 @@ def build_analysis(results: list[RepoResult]) -> AnalysisBundle:
 
 
 def _has_repo_marker(text: str) -> bool:
-    return bool(re.search(r"repo\s*\d+", text, re.I))
+    return bool(re.search(r"repo\s*\d+", text, re.IGNORECASE))
 
 
 def _has_english(text: str) -> bool:
@@ -419,7 +722,7 @@ def _has_english(text: str) -> bool:
 
 def _has_colloquial(text: str) -> bool:
     markers = ["帮我", "请你", "搞一个", "弄一个", "来个", "给我", "整一个"]
-    return any(m in text for m in markers)
+    return any(marker in text for marker in markers)
 
 
 def rewrite_prompt_to_formal_chinese(
@@ -429,8 +732,8 @@ def rewrite_prompt_to_formal_chinese(
 ) -> str:
     system_prompt = (
         "你是提示词改写助手。"
-        "请将输入改写为正式、具体、可执行的中文提示词。"
-        "不得出现英文、不得出现repo编号、不得出现网址、不得口语化。"
+        "请把输入改写为正式、具体、可执行的中文提示词。"
+        "不得出现英文、repo编号、网址、口语化表达。"
         "只返回改写后的文本。"
     )
     human_prompt = f"用途：{purpose}\n原文：{prompt_text}"
@@ -444,9 +747,9 @@ def _sort_repos(items: list[RepoResult]) -> list[RepoResult]:
     return sorted(items, key=lambda x: (x.score, x.repo_id))
 
 
-def _has_meaningful_remark(text: str) -> bool:
-    cleaned = text.strip()
-    return cleaned not in {"", "无", "none", "None", "N/A", "na"}
+def _has_runtime_bug(repo_id: str, analysis: AnalysisBundle) -> bool:
+    runtime = analysis.runtime_checks.get(repo_id)
+    return bool(runtime and runtime.checked and (not runtime.passed))
 
 
 def _fallback_debug_prompt(
@@ -456,26 +759,65 @@ def _fallback_debug_prompt(
 ) -> str:
     selected = _repo_by_id(debug_repo, results)
     note = selected.remark.strip() if selected else ""
-    extra = "；".join(analysis.repo_issues.get(debug_repo, [])[:3])
-    problem_desc = note if note else "当前版本存在规则判定与交互反馈不一致问题"
-    if extra:
-        problem_desc = f"{problem_desc}；并发现：{extra}"
-
+    runtime = analysis.runtime_checks.get(debug_repo)
+    runtime_part = "；".join(runtime.behavior_issues[:2]) if runtime else ""
+    issue_part = "；".join(analysis.repo_issues.get(debug_repo, [])[:2])
+    chunks = [chunk for chunk in [note, runtime_part, issue_part] if chunk]
+    summary = "；".join(chunks) if chunks else "当前实现存在行为与规则判定不一致问题"
     return (
-        f"当前版本存在以下问题：{problem_desc}。"
-        "请完成根因定位与修复，确保规则判定、状态流转和交互反馈一致。"
-        "请提供最小复现步骤、修复方案、关键改动点及覆盖边界场景的回归验证结果。"
+        f"请修复当前页面中的关键缺陷：{summary}。"
+        "请先给出最小复现步骤，再提供根因分析与修复方案。"
+        "修复后请给出覆盖正常流程与边界场景的回归验证结果。"
     )
 
 
 def _fallback_new_requirement_prompt() -> str:
     return (
-        "在不改变现有核心规则的前提下，新增“落子结果预览”功能。"
-        "功能要求：当鼠标悬停在可落子位置时，实时高亮即将被推移的棋子与目标落点；"
-        "若目标落点越界，应显示越界提示并标注被移出棋盘的棋子。"
-        "验收标准：随机选择三个可落子位置进行验证，预览结果与实际执行结果逐项一致；"
-        "开启与关闭预览功能后，现有回合流程、胜负判定与交互响应保持一致。"
+        "在不改变现有核心规则的前提下，新增“操作历史回放”功能。"
+        "功能要求：记录每一步操作的落点、受影响棋子与结果状态，支持逐步回放。"
+        "验收标准：随机选取三局对局进行校验，回放内容与实际执行结果逐步一致，"
+        "且新增功能不影响现有回合切换和胜负判定。"
     )
+
+
+def _pick_debug_repo(results: list[RepoResult], analysis: AnalysisBundle) -> str:
+    ordered = _sort_repos(results)
+    bug_repos = [r for r in ordered if _has_runtime_bug(r.repo_id, analysis)]
+    bug_with_remark = [r for r in bug_repos if _is_meaningful_remark(r.remark)]
+    if bug_with_remark:
+        return bug_with_remark[0].repo_id
+
+    bug_score01 = [r for r in bug_repos if r.score in {0, 1}]
+    if bug_score01:
+        return bug_score01[0].repo_id
+
+    remark_repos = [r for r in ordered if _is_meaningful_remark(r.remark)]
+    if remark_repos:
+        return remark_repos[0].repo_id
+
+    score0 = [r for r in ordered if r.score == 0]
+    if score0:
+        return score0[0].repo_id
+
+    score1 = [r for r in ordered if r.score == 1]
+    if score1:
+        return score1[0].repo_id
+    return ""
+
+
+def _eligible_score2_repo_ids(results: list[RepoResult], analysis: AnalysisBundle) -> list[str]:
+    eligible: list[str] = []
+    for result in _sort_repos([r for r in results if r.score == 2]):
+        runtime = analysis.runtime_checks.get(result.repo_id)
+        if (
+            runtime
+            and runtime.checked
+            and runtime.passed
+            and runtime.behavior_checked
+            and runtime.behavior_passed
+        ):
+            eligible.append(result.repo_id)
+    return eligible
 
 
 def validate_and_fix_decision(
@@ -487,40 +829,15 @@ def validate_and_fix_decision(
     debug_repo = decision.debug_rewrite_repo.strip()
     new_repo = decision.new_requirement_rewrite_repo.strip()
 
-    remark_candidates = _sort_repos(
-        [r for r in results if _has_meaningful_remark(r.remark)]
-    )
-    score0 = _sort_repos([r for r in results if r.score == 0])
-    score1 = _sort_repos([r for r in results if r.score == 1])
-    score2 = _sort_repos([r for r in results if r.score == 2])
-
+    preferred_debug = _pick_debug_repo(results, analysis)
     selected_debug = _repo_by_id(debug_repo, results) if debug_repo else None
-    if selected_debug is None:
-        if remark_candidates:
-            debug_repo = remark_candidates[0].repo_id
-        elif score0:
-            debug_repo = score0[0].repo_id
-        elif score1:
-            debug_repo = score1[0].repo_id
-        else:
-            debug_repo = ""
+    if selected_debug is None or not debug_repo:
+        debug_repo = preferred_debug
     else:
-        selected_has_remark = _has_meaningful_remark(selected_debug.remark)
-        if remark_candidates and not selected_has_remark:
-            debug_repo = remark_candidates[0].repo_id
-        elif (
-            selected_debug.score not in {0, 1}
-            and not selected_has_remark
-            and (score0 or score1)
-        ):
-            debug_repo = (score0 + score1)[0].repo_id
+        if preferred_debug and not _has_runtime_bug(selected_debug.repo_id, analysis):
+            debug_repo = preferred_debug
 
-    eligible_score2: list[str] = []
-    for item in score2:
-        runtime = analysis.runtime_checks.get(item.repo_id)
-        if runtime and runtime.checked and runtime.passed:
-            eligible_score2.append(item.repo_id)
-
+    eligible_score2 = _eligible_score2_repo_ids(results, analysis)
     selected_new = _repo_by_id(new_repo, results) if new_repo else None
     if (
         selected_new is None
@@ -543,14 +860,15 @@ def validate_and_fix_decision(
         if not new_prompt:
             new_prompt = _fallback_new_requirement_prompt()
         if not unable_note:
-            unable_note = "无。已选择运行检查通过的 2 分产物用于新增需求。"
+            unable_note = "无。已选择通过行为验证的 2 分产物用于新增需求。"
     else:
         new_prompt = ""
         if not unable_note:
-            if score2:
+            score2_exists = any(r.score == 2 for r in results)
+            if score2_exists:
                 unable_note = (
-                    "所有 2 分 repo 经运行检查后均存在明显 bug "
-                    "或无法完成运行验证，无法新增需求。"
+                    "所有 2 分 repo 在运行或行为验证中存在问题，"
+                    "无法安全新增需求。"
                 )
             else:
                 unable_note = "没有可用的 2 分 repo，无法新增需求。"
@@ -578,7 +896,24 @@ def validate_and_fix_decision(
     )
 
 
-def build_llm_input(parsed: ParsedInput, results: list[RepoResult], analysis: AnalysisBundle) -> str:
+def _behavior_summary(runtime: RuntimeCheck | None) -> dict[str, Any]:
+    if runtime is None:
+        return {}
+    evidence = runtime.behavior_evidence
+    return {
+        "behavior_checked": runtime.behavior_checked,
+        "behavior_passed": runtime.behavior_passed,
+        "behavior_issue_count": len(runtime.behavior_issues),
+        "behavior_issues": runtime.behavior_issues,
+        "behavior_evidence": evidence,
+    }
+
+
+def build_llm_input(
+    parsed: ParsedInput,
+    results: list[RepoResult],
+    analysis: AnalysisBundle,
+) -> str:
     cases: list[dict[str, Any]] = []
     for result in results:
         runtime = analysis.runtime_checks.get(result.repo_id)
@@ -597,6 +932,7 @@ def build_llm_input(parsed: ParsedInput, results: list[RepoResult], analysis: An
                 "runtime_checked": runtime.checked if runtime else False,
                 "runtime_passed": runtime.passed if runtime else False,
                 "runtime_issues": runtime.issues if runtime else [],
+                "behavior": _behavior_summary(runtime),
             }
         )
 
@@ -604,12 +940,19 @@ def build_llm_input(parsed: ParsedInput, results: list[RepoResult], analysis: An
         "uid": parsed.uid,
         "base_prompt": parsed.base_prompt,
         "rules": {
-            "debug_select_priority": "优先选择有具体remark的repo；若无remark，再依次选择0分和1分；只选1个。",
-            "new_requirement_select": "新增需求改写repo只能选择2分且运行检查通过的repo；若没有则留空。",
-            "prompt_language": "debug_prompt和new_requirement_prompt必须是中文。",
-            "prompt_content": "两个prompt禁止出现repo编号、网址和英文。",
-            "style": "两个prompt必须正式、具体、非口语化。",
-            "new_requirement_prompt": "新增需求必须是单一具体功能，并包含明确验收标准。",
+            "selection_core": (
+                "优先基于行为验证结果选择debug对象；"
+                "在行为问题候选中，优先有具体remark的repo。"
+            ),
+            "debug_select_priority": (
+                "有行为问题+有remark > 有行为问题且0/1分 > 有remark > 0分 > 1分。"
+            ),
+            "new_requirement_select": (
+                "新增需求改写repo只能选择2分且运行与行为验证均通过的repo。"
+            ),
+            "prompt_style": "两个prompt必须中文、正式、具体、非口语化。",
+            "prompt_forbidden": "两个prompt中不得出现repo编号、网址、英文。",
+            "new_requirement_constraint": "新增需求必须是单一具体功能，且包含验收标准。",
         },
         "global_extra_issues": analysis.global_issues,
         "cases": cases,
@@ -636,12 +979,13 @@ def decide_for_case(
 ) -> AgentDecision:
     system_prompt = (
         "你是用于生成质检提示词的Agent。"
-        "你必须输出JSON对象。"
-        "debug和新增需求各只选一个repo。"
-        "新增需求改写repo只能从“2分且运行检查通过”的repo中选择，若无可选项必须留空。"
-        "两个prompt必须是中文、正式、具体、非口语化，且不能出现repo编号、网址和英文。"
-        "新增需求prompt必须是一个具体功能，并给出验收标准。"
-        "请结合extra_issues、runtime_issues、global_extra_issues综合判断。"
+        "必须输出JSON对象。"
+        "请以行为验证结论为主要依据，评分和备注仅作辅助。"
+        "debug与新增需求各只选一个repo。"
+        "新增需求改写repo只能从“2分且运行与行为验证均通过”的repo中选择；"
+        "若无可选项必须留空并写明原因。"
+        "两个prompt必须中文、正式、具体、非口语化，不得出现repo编号、网址和英文。"
+        "新增需求prompt必须是一个具体功能，并包含验收标准。"
     )
     human_prompt = (
         "请根据以下输入返回JSON对象。"
@@ -707,57 +1051,54 @@ def process_excel(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Input Excel not found: {input_path}")
 
     output_path = Path(args.output_xlsx) if args.output_xlsx else input_path
-    wb = load_workbook(input_path)
-    ws = wb[args.sheet_name] if args.sheet_name else wb[wb.sheetnames[0]]
+    workbook = load_workbook(input_path)
+    sheet = workbook[args.sheet_name] if args.sheet_name else workbook[workbook.sheetnames[0]]
 
-    mapping = _header_map(ws)
-    _assert_input_headers(mapping)
-    mapping = _ensure_output_headers(ws, mapping)
+    raw_map = _raw_header_map(sheet)
+    input_cols = _resolve_input_columns(raw_map)
+    output_cols = _ensure_output_columns(sheet, raw_map)
 
     llm = _build_chat_model()
     processed = 0
-    all_fetch_payloads: list[dict[str, Any]] = []
+    debug_payloads: list[dict[str, Any]] = []
 
-    for row_idx in range(args.start_row, ws.max_row + 1):
+    for row_idx in range(args.start_row, sheet.max_row + 1):
         if args.max_rows > 0 and processed >= args.max_rows:
             break
 
-        row_input = parse_row_input(ws, row_idx, mapping)
+        row_input = parse_row_input(sheet, row_idx, input_cols)
         if row_input is None:
             continue
         if args.uid and row_input.uid != args.uid:
             continue
 
-        print(f"[Row {row_idx}] uid={row_input.uid}: fetching repos...")
+        print(f"[Row {row_idx}] uid={row_input.uid}: fetch + behavior validation...")
         repo_results = fetch_repos(row_input)
-        analysis = build_analysis(repo_results)
+        analysis = build_analysis(repo_results, row_input.base_prompt)
 
-        print(f"[Row {row_idx}] uid={row_input.uid}: calling LLM...")
+        print(f"[Row {row_idx}] uid={row_input.uid}: llm decision...")
         decision = decide_for_case(llm, row_input, repo_results, analysis)
 
-        ws.cell(row=row_idx, column=mapping["debug prompt"]).value = decision.debug_prompt
-        ws.cell(row=row_idx, column=mapping["debug 改写repo"]).value = decision.debug_rewrite_repo
-        ws.cell(row=row_idx, column=mapping["无法写debug改写备注"]).value = _debug_unable_note(decision)
-        ws.cell(row=row_idx, column=mapping["新增需求 prompt"]).value = decision.new_requirement_prompt
-        ws.cell(row=row_idx, column=mapping["新增需求改写 repo"]).value = decision.new_requirement_rewrite_repo
-        ws.cell(row=row_idx, column=mapping["无法新增需求备注"]).value = (
+        sheet.cell(row=row_idx, column=output_cols["debug_prompt"]).value = decision.debug_prompt
+        sheet.cell(row=row_idx, column=output_cols["debug_repo"]).value = decision.debug_rewrite_repo
+        sheet.cell(row=row_idx, column=output_cols["debug_unable_note"]).value = _debug_unable_note(decision)
+        sheet.cell(row=row_idx, column=output_cols["new_prompt"]).value = decision.new_requirement_prompt
+        sheet.cell(row=row_idx, column=output_cols["new_repo"]).value = decision.new_requirement_rewrite_repo
+        sheet.cell(row=row_idx, column=output_cols["new_unable_note"]).value = (
             decision.unable_to_add_requirement_note
         )
 
-        all_fetch_payloads.append(
+        debug_payloads.append(
             {
                 "row": row_idx,
                 "uid": row_input.uid,
-                "base_prompt": row_input.base_prompt,
-                "repo_urls": row_input.repo_urls,
-                "scores": row_input.scores,
-                "remarks": row_input.remarks,
-                "results": [asdict(r) for r in repo_results],
+                "input": asdict(row_input),
+                "results": [asdict(item) for item in repo_results],
                 "analysis": {
                     "repo_issues": analysis.repo_issues,
                     "global_issues": analysis.global_issues,
                     "runtime_checks": {
-                        k: asdict(v) for k, v in analysis.runtime_checks.items()
+                        key: asdict(value) for key, value in analysis.runtime_checks.items()
                     },
                 },
                 "decision": decision.model_dump(),
@@ -767,9 +1108,9 @@ def process_excel(args: argparse.Namespace) -> None:
         processed += 1
         print(f"[Row {row_idx}] uid={row_input.uid}: done.")
 
-    wb.save(output_path)
+    workbook.save(output_path)
     Path(args.fetch_json).write_text(
-        json.dumps(all_fetch_payloads, ensure_ascii=False, indent=2),
+        json.dumps(debug_payloads, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     print(f"Processed rows: {processed}")
