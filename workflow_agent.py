@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,7 +39,7 @@ class AgentDecision(BaseModel):
     debug_prompt: str = Field(..., description="Debug prompt content.")
     debug_rewrite_repo: str = Field(
         ...,
-        description="Selected repo id for debug, e.g. repo3 or empty string.",
+        description="Selected debug repo id, e.g. repo1, or empty string.",
     )
     new_requirement_prompt: str = Field(
         ...,
@@ -46,11 +47,11 @@ class AgentDecision(BaseModel):
     )
     new_requirement_rewrite_repo: str = Field(
         ...,
-        description="Selected repo id for new requirement, e.g. repo7 or empty string.",
+        description="Selected new-requirement repo id, e.g. repo7, or empty string.",
     )
     unable_to_add_requirement_note: str = Field(
         ...,
-        description="Reason note when new requirement cannot be added.",
+        description="Reason note when cannot add requirement.",
     )
 
 
@@ -108,7 +109,8 @@ def parse_input_md(path: Path) -> ParsedInput:
     remarks: dict[int, str] = {}
     for line in text.splitlines():
         stripped = line.strip()
-        match = re.match(r"^repo(\d+)\W+(.+)$", stripped)
+        # Handles lines like: repo1：xxx or repo1: xxx
+        match = re.match(r"^repo(\d+)\D+(.+)$", stripped)
         if match is None:
             continue
         idx = int(match.group(1))
@@ -171,10 +173,6 @@ def write_fetch_json(path: Path, data: ParsedInput, results: list[RepoResult]) -
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _repo_exists(repo_id: str, results: list[RepoResult]) -> bool:
-    return any(r.repo_id == repo_id for r in results)
-
-
 def _repo_by_id(repo_id: str, results: list[RepoResult]) -> RepoResult | None:
     for r in results:
         if r.repo_id == repo_id:
@@ -193,40 +191,36 @@ def validate_and_fix_decision(
     score01 = [r for r in results if r.score in (0, 1)]
     score2 = [r for r in results if r.score == 2]
 
-    # Debug repo guardrail: prefer remark first, then 0/1.
-    if debug_repo and not _repo_exists(debug_repo, results):
-        debug_repo = ""
-    if debug_repo:
-        selected = _repo_by_id(debug_repo, results)
-        if selected is None:
-            debug_repo = ""
-        else:
-            if selected.remark == "" and remark_candidates:
-                debug_repo = remark_candidates[0].repo_id
-            elif selected.score not in (0, 1) and score01:
-                debug_repo = score01[0].repo_id
-    else:
+    # Debug repo: prefer remark first, then 0/1.
+    selected_debug = _repo_by_id(debug_repo, results) if debug_repo else None
+    if selected_debug is None:
         if remark_candidates:
             debug_repo = remark_candidates[0].repo_id
         elif score01:
             debug_repo = score01[0].repo_id
-
-    # New requirement guardrail: must be score=2 and exactly one repo.
-    if new_repo and not _repo_exists(new_repo, results):
-        new_repo = ""
-    if new_repo:
-        selected = _repo_by_id(new_repo, results)
-        if selected is None or selected.score != 2:
-            new_repo = score2[0].repo_id if score2 else ""
+        else:
+            debug_repo = ""
     else:
+        if selected_debug.remark == "" and remark_candidates:
+            debug_repo = remark_candidates[0].repo_id
+        elif selected_debug.score not in (0, 1):
+            if score01:
+                debug_repo = score01[0].repo_id
+            else:
+                debug_repo = ""
+
+    # New requirement repo: must be score=2 only.
+    selected_new = _repo_by_id(new_repo, results) if new_repo else None
+    if selected_new is None or selected_new.score != 2:
         new_repo = score2[0].repo_id if score2 else ""
 
     debug_prompt = decision.debug_prompt.strip()
     if not debug_prompt:
         if debug_repo:
-            note = _repo_by_id(debug_repo, results).remark if _repo_by_id(debug_repo, results) else "存在问题"
+            debug_note = _repo_by_id(debug_repo, results)
+            note = debug_note.remark if debug_note and debug_note.remark else "存在问题"
             debug_prompt = (
-                f"请修复 `{debug_repo}`，当前问题：{note}。"
+                f"请修复 `{debug_repo}`。当前问题：{note}。"
                 "请定位根因并修复，不要影响已有可用功能。"
             )
         else:
@@ -238,14 +232,14 @@ def validate_and_fix_decision(
         if not new_prompt:
             new_prompt = (
                 f"请基于 `{new_repo}` 新增一个具体功能：落子结果预览。"
-                "要求：悬停可落子格时显示会被推动的棋子及目标位置，若将被挤出棋盘需明确标记，"
-                "且点击落子后的实际结果必须和预览一致。"
+                "要求：悬停可落子格时显示会被推动的棋子及目标位置，"
+                "若将被挤出棋盘需明确标记，点击落子后的实际结果必须与预览一致。"
             )
         unable_note = "无。已完成新增需求 repo 选择。"
     else:
         new_prompt = ""
         if not unable_note:
-            unable_note = "没有可用的 2 分 case，无法新增需求。"
+            unable_note = "没有可用的 2 分 repo，无法新增需求。"
 
     return AgentDecision(
         debug_prompt=debug_prompt,
@@ -277,7 +271,7 @@ def build_llm_input(parsed: ParsedInput, results: list[RepoResult]) -> str:
         "base_prompt": parsed.base_prompt,
         "rules": {
             "debug_select_priority": "优先选择有具体remark的repo；若无remark，再选0分；再选1分；debug只选1个repo",
-            "new_requirement_select": "优先选择2分repo；新增需求只选1个repo",
+            "new_requirement_select": "新增需求改写repo只能选择2分repo；若没有2分repo必须留空",
             "new_requirement_prompt": "必须是单一具体功能，不能笼统描述",
         },
         "cases": cases,
@@ -287,7 +281,6 @@ def build_llm_input(parsed: ParsedInput, results: list[RepoResult]) -> str:
 
 def call_llm(parsed: ParsedInput, results: list[RepoResult]) -> AgentDecision:
     load_dotenv()
-    import os
 
     base_url = os.getenv("MODEL_BASE_URL")
     api_key = os.getenv("MODEL_API_KEY")
@@ -301,24 +294,24 @@ def call_llm(parsed: ParsedInput, results: list[RepoResult]) -> AgentDecision:
         api_key=api_key,
         base_url=base_url,
     )
-
     system_prompt = (
         "你是一个用于生成质检prompt的工程Agent。"
-        "你必须基于输入case信息输出严格JSON。"
-        "新增需求prompt必须是一个明确的单一功能，不允许笼统描述。"
+        "你必须基于输入case信息输出严格结构化结果。"
         "debug和新增需求各只选一个repo。"
-        "你输出的JSON必须包含以下键："
-        "debug_prompt,debug_rewrite_repo,new_requirement_prompt,new_requirement_rewrite_repo,unable_to_add_requirement_note"
+        "新增需求prompt必须是一个明确单一功能。"
+        "新增需求改写repo必须是2分repo；若不存在2分repo，必须输出空字符串。"
     )
     human_prompt = (
-        "请根据以下输入生成结果JSON，不要输出任何解释。\n"
+        "请根据以下输入生成结果。"
+        "请只输出JSON对象，不要输出解释，不要输出markdown代码块。\n"
         f"{build_llm_input(parsed, results)}"
     )
-    messages = [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
-    response = llm.invoke(messages)
+
+    response = llm.invoke(
+        [SystemMessage(content=system_prompt), HumanMessage(content=human_prompt)]
+    )
     content = str(response.content).strip()
 
-    # Handle optional markdown code fence.
     fence_match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", content)
     if fence_match:
         content = fence_match.group(1)
@@ -328,12 +321,39 @@ def call_llm(parsed: ParsedInput, results: list[RepoResult]) -> AgentDecision:
     except json.JSONDecodeError as exc:
         raise ValueError(f"LLM did not return valid JSON: {content}") from exc
 
+    if not isinstance(raw, dict):
+        raise ValueError(f"LLM output must be a JSON object: {raw}")
+
+    normalized = {
+        "debug_prompt": raw.get("debug_prompt", ""),
+        "debug_rewrite_repo": raw.get("debug_rewrite_repo", raw.get("debug_repo_id", "")),
+        "new_requirement_prompt": raw.get(
+            "new_requirement_prompt",
+            raw.get("new_requirement", {}).get("prompt", "")
+            if isinstance(raw.get("new_requirement"), dict)
+            else "",
+        ),
+        "new_requirement_rewrite_repo": raw.get(
+            "new_requirement_rewrite_repo",
+            raw.get(
+                "new_requirement_repo_id",
+                raw.get("new_requirement", {}).get("repo_id", "")
+                if isinstance(raw.get("new_requirement"), dict)
+                else "",
+            ),
+        ),
+        "unable_to_add_requirement_note": raw.get(
+            "unable_to_add_requirement_note",
+            raw.get("unable_note", ""),
+        ),
+    }
+
     try:
-        parsed_decision = AgentDecision.model_validate(raw)
+        decision = AgentDecision.model_validate(normalized)
     except ValidationError as exc:
         raise ValueError(f"LLM output schema invalid: {raw}") from exc
 
-    return validate_and_fix_decision(parsed_decision, results)
+    return validate_and_fix_decision(decision, results)
 
 
 def write_output_md(path: Path, decision: AgentDecision) -> None:
