@@ -684,7 +684,6 @@ def build_analysis(results: list[RepoResult], base_prompt: str) -> AnalysisBundl
             issues.append("页面标题疑似默认模板。")
         if result.text_length == 0:
             empty_text.append(result.repo_id)
-            issues.append("正文提取为空，可能依赖前端渲染。")
 
         runtime = run_runtime_check(result.repo_id, result.url, base_prompt)
         runtime_checks[result.repo_id] = runtime
@@ -692,6 +691,10 @@ def build_analysis(results: list[RepoResult], base_prompt: str) -> AnalysisBundl
             issues.extend(runtime.issues)
         if runtime.checked and not runtime.behavior_passed:
             behavior_failed.append(result.repo_id)
+        # “正文提取为空”通常是抓取层信号，不应单独主导 debug。
+        # 仅在运行/行为也异常时，才将其升级为可行动问题。
+        if result.text_length == 0 and (not runtime.passed or not runtime.behavior_passed):
+            issues.append("正文提取为空，且页面运行行为异常。")
 
         if issues:
             repo_issues[result.repo_id] = issues
@@ -761,7 +764,15 @@ def _fallback_debug_prompt(
     note = selected.remark.strip() if selected else ""
     runtime = analysis.runtime_checks.get(debug_repo)
     runtime_part = "；".join(runtime.behavior_issues[:2]) if runtime else ""
-    issue_part = "；".join(analysis.repo_issues.get(debug_repo, [])[:2])
+
+    raw_issue_part = analysis.repo_issues.get(debug_repo, [])
+    filtered_issue_part = [
+        item
+        for item in raw_issue_part
+        if "正文提取为空，可能依赖前端渲染" not in item
+    ]
+    issue_part = "；".join(filtered_issue_part[:2])
+
     chunks = [chunk for chunk in [note, runtime_part, issue_part] if chunk]
     summary = "；".join(chunks) if chunks else "当前实现存在行为与规则判定不一致问题"
     return (
@@ -853,6 +864,9 @@ def validate_and_fix_decision(
             if debug_repo
             else DEBUG_UNABLE_TEXT
         )
+    if not debug_repo:
+        # 没有选中 debug 对象时，必须明确输出“无法写 debug”，避免出现无对象 prompt。
+        debug_prompt = DEBUG_UNABLE_TEXT
 
     new_prompt = decision.new_requirement_prompt.strip()
     unable_note = decision.unable_to_add_requirement_note.strip()
