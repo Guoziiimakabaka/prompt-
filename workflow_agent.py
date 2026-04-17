@@ -831,6 +831,50 @@ def _eligible_score2_repo_ids(results: list[RepoResult], analysis: AnalysisBundl
     return eligible
 
 
+def _summarize_score2_failures(results: list[RepoResult], analysis: AnalysisBundle) -> str:
+    score2_repos = _sort_repos([r for r in results if r.score == 2])
+    if not score2_repos:
+        return "没有可用的 2 分 repo，无法新增需求。"
+
+    details: list[str] = []
+    low_signal = {
+        "正文提取为空，可能依赖前端渲染。",
+    }
+
+    for item in score2_repos:
+        runtime = analysis.runtime_checks.get(item.repo_id)
+        reasons: list[str] = []
+
+        if runtime is None:
+            reasons.append("未完成运行检查。")
+        else:
+            if not runtime.checked:
+                reasons.append("运行检查未完成。")
+            if runtime.behavior_checked and not runtime.behavior_passed:
+                reasons.extend(runtime.behavior_issues)
+            elif not runtime.passed:
+                reasons.extend(runtime.issues)
+
+        reasons.extend(analysis.repo_issues.get(item.repo_id, []))
+
+        normalized: list[str] = []
+        for reason in reasons:
+            text = _to_text(reason)
+            if not text:
+                continue
+            if text in low_signal:
+                continue
+            if text not in normalized:
+                normalized.append(text)
+
+        if not normalized:
+            normalized = ["未通过运行或行为验证。"]
+
+        details.append(f"{item.repo_id}：{'；'.join(normalized[:2])}")
+
+    return "2 分 repo 均未达到新增需求条件：" + " | ".join(details)
+
+
 def validate_and_fix_decision(
     decision: AgentDecision,
     results: list[RepoResult],
@@ -880,10 +924,7 @@ def validate_and_fix_decision(
         if not unable_note:
             score2_exists = any(r.score == 2 for r in results)
             if score2_exists:
-                unable_note = (
-                    "所有 2 分 repo 在运行或行为验证中存在问题，"
-                    "无法安全新增需求。"
-                )
+                unable_note = _summarize_score2_failures(results, analysis)
             else:
                 unable_note = "没有可用的 2 分 repo，无法新增需求。"
 
