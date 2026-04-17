@@ -9,7 +9,7 @@ from typing import Any
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from app import extract_page_content
 
@@ -35,18 +35,18 @@ class RepoResult:
     error: str
 
 
+@dataclass
+class FetchAnalysis:
+    repo_issues: dict[str, list[str]]
+    global_issues: list[str]
+
+
 class AgentDecision(BaseModel):
     debug_prompt: str = Field(...)
     debug_rewrite_repo: str = Field(...)
     new_requirement_prompt: str = Field(...)
     new_requirement_rewrite_repo: str = Field(...)
     unable_to_add_requirement_note: str = Field(...)
-
-
-@dataclass
-class FetchAnalysis:
-    repo_issues: dict[str, list[str]]
-    global_issues: list[str]
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,11 +103,15 @@ def parse_input_md(path: Path) -> ParsedInput:
     remarks: dict[int, str] = {}
     for line in text.splitlines():
         stripped = line.strip()
-        match = re.match(r"^repo(\d+)\D+(.+)$", stripped)
-        if match is None:
+        if not stripped.lower().startswith("repo"):
             continue
-        idx = int(match.group(1))
-        note = match.group(2).strip()
+        m = re.match(r"^repo(\d+)\s*[：:]\s*(.+)$", stripped)
+        if m is None:
+            m = re.match(r"^repo(\d+)\W(.+)$", stripped)
+        if m is None:
+            continue
+        idx = int(m.group(1))
+        note = m.group(2).strip()
         if 1 <= idx <= 7 and note:
             remarks[idx] = note
 
@@ -168,15 +172,16 @@ def write_fetch_json(path: Path, data: ParsedInput, results: list[RepoResult]) -
 
 def analyze_fetch_json(path: Path) -> FetchAnalysis:
     raw = json.loads(path.read_text(encoding="utf-8"))
-    results = raw.get("results", [])
+    items = raw.get("results", [])
     repo_issues: dict[str, list[str]] = {}
     global_issues: list[str] = []
 
-    generic_title_repos: list[str] = []
-    empty_text_repos: list[str] = []
-    failed_repos: list[str] = []
+    failed: list[str] = []
+    default_title: list[str] = []
+    empty_text: list[str] = []
+    likely_csr: list[str] = []
 
-    for item in results:
+    for item in items:
         repo_id = str(item.get("repo_id", "")).strip()
         if not repo_id:
             continue
@@ -187,28 +192,29 @@ def analyze_fetch_json(path: Path) -> FetchAnalysis:
         error = str(item.get("error", "")).strip()
 
         if not ok:
-            failed_repos.append(repo_id)
+            failed.append(repo_id)
             issues.append(f"页面访问或解析失败：{error or '未知错误'}")
         if title in {"React App", ""}:
-            generic_title_repos.append(repo_id)
-            issues.append("页面标题未定制，疑似默认模板页面。")
+            default_title.append(repo_id)
+            issues.append("页面标题未定制，疑似默认模板。")
         if text_length == 0:
-            empty_text_repos.append(repo_id)
-            issues.append("未提取到正文文本，疑似首屏内容缺失或脚本渲染异常。")
+            empty_text.append(repo_id)
+            issues.append("未提取到正文文本。")
+            if ok and title not in {"", "React App"}:
+                likely_csr.append(repo_id)
+                issues.append("疑似依赖脚本渲染，首屏静态内容不足。")
 
         if issues:
             repo_issues[repo_id] = issues
 
-    if failed_repos:
-        global_issues.append(f"以下页面抓取失败：{', '.join(failed_repos)}。")
-    if generic_title_repos:
-        global_issues.append(
-            f"以下页面标题为默认模板或空标题：{', '.join(generic_title_repos)}。"
-        )
-    if empty_text_repos:
-        global_issues.append(
-            f"以下页面未提取到正文文本：{', '.join(empty_text_repos)}。"
-        )
+    if failed:
+        global_issues.append(f"抓取失败页面：{', '.join(failed)}。")
+    if default_title:
+        global_issues.append(f"默认标题页面：{', '.join(default_title)}。")
+    if empty_text:
+        global_issues.append(f"正文为空页面：{', '.join(empty_text)}。")
+    if likely_csr:
+        global_issues.append(f"疑似前端脚本渲染主导页面：{', '.join(likely_csr)}。")
 
     return FetchAnalysis(repo_issues=repo_issues, global_issues=global_issues)
 
@@ -230,14 +236,13 @@ def _has_english(text: str) -> bool:
 
 def _has_colloquial(text: str) -> bool:
     markers = ["吧", "一下", "帮我", "请你", "搞一下", "弄一下"]
-    return any(marker in text for marker in markers)
+    return any(m in text for m in markers)
 
 
-def _clean_note_for_chinese(note: str) -> str:
-    cleaned = re.sub(r"[A-Za-z]+", "", note)
-    cleaned = re.sub(r"\s+", "", cleaned)
-    if len(cleaned) < 4:
-        return "游戏机制存在错误"
+def _clean_note(note: str) -> str:
+    cleaned = note.strip()
+    if not cleaned:
+        return "游戏核心机制存在实现错误"
     return cleaned
 
 
@@ -247,23 +252,22 @@ def _fallback_debug_prompt(
     analysis: FetchAnalysis,
 ) -> str:
     selected = _repo_by_id(debug_repo, results)
-    note = _clean_note_for_chinese(selected.remark) if selected else "游戏机制存在错误"
-    extra = "；".join(analysis.repo_issues.get(debug_repo, [])[:2])
-    extra_clause = f"；同时需关注：{extra}" if extra else ""
+    note = _clean_note(selected.remark if selected else "")
+    extras = "；".join(analysis.repo_issues.get(debug_repo, [])[:2])
+    extra_clause = f"；需同步核查：{extras}" if extras else ""
     return (
         f"当前版本存在以下问题：{note}{extra_clause}。"
-        "请完成根因定位与修复，修复后需执行完整对局回归测试，"
-        "确保不再出现卡死、错误判定、棋子状态异常或交互失效。"
+        "请完成根因定位与修复，并提供回归验证结果。"
+        "验证范围至少包括：落子行为、规则判定、棋子状态流转、异常边界场景。"
     )
 
 
 def _fallback_new_requirement_prompt() -> str:
     return (
-        "在不改变当前核心规则的前提下，新增“落子结果预览”功能："
-        "当鼠标悬停到可落子位置时，实时显示会被推动的棋子和目标落点；"
-        "如果会被挤出棋盘，需要明确提示；"
-        "点击落子后的实际结果必须与预览一致；"
-        "并补充验收标准：随机抽取三个可落子位置，预览结果与实际执行结果逐项一致。"
+        "在不改变现有核心规则的前提下，新增“落子结果预览”功能。"
+        "功能要求：当鼠标悬停于可落子位置时，实时展示受影响棋子与目标落点；"
+        "若目标落点越界，需明确提示将被移出棋盘。"
+        "验收标准：随机选择三个可落子位置，预览结果与实际执行结果逐项一致。"
     )
 
 
@@ -275,8 +279,8 @@ def rewrite_prompt_to_formal_chinese(
     system_prompt = (
         "你是提示词改写助手。"
         "请将输入改写为正式、具体、可执行的中文提示词。"
-        "必须满足：不能出现英文、不能出现repo编号、不能出现网址、不能口语化。"
-        "只返回改写后的文本，不要解释。"
+        "必须满足：不得出现英文、不得出现repo编号、不得出现网址、不得口语化。"
+        "仅返回改写后的文本。"
     )
     human_prompt = f"用途：{purpose}\n原文：{prompt_text}"
     result = llm.invoke(
@@ -298,7 +302,7 @@ def validate_and_fix_decision(
     score01 = [r for r in results if r.score in (0, 1)]
     score2 = [r for r in results if r.score == 2]
 
-    # Debug repo: prefer remark first, then 0/1.
+    # Debug repo rule.
     selected_debug = _repo_by_id(debug_repo, results) if debug_repo else None
     if selected_debug is None:
         if remark_candidates:
@@ -313,7 +317,7 @@ def validate_and_fix_decision(
         elif selected_debug.score not in (0, 1):
             debug_repo = score01[0].repo_id if score01 else ""
 
-    # New requirement repo: MUST be score=2 only.
+    # New requirement repo rule: must be score=2.
     selected_new = _repo_by_id(new_repo, results) if new_repo else None
     if selected_new is None or selected_new.score != 2:
         new_repo = score2[0].repo_id if score2 else ""
@@ -336,31 +340,25 @@ def validate_and_fix_decision(
     else:
         new_prompt = ""
         if not unable_note:
-            # Keep your preferred local wording.
             unable_note = "7个repo都有逻辑错误，无法新增需求"
 
-    # Enforce Chinese-only and no repo mention in both prompts.
+    # Enforce style.
     if _has_repo_marker(debug_prompt) or _has_english(debug_prompt) or _has_colloquial(debug_prompt):
         rewritten = rewrite_prompt_to_formal_chinese(llm, debug_prompt, "调试提示词")
-        debug_prompt = (
-            rewritten
-            if rewritten
-            else _fallback_debug_prompt(results, debug_repo, analysis)
-        )
+        debug_prompt = rewritten if rewritten else _fallback_debug_prompt(results, debug_repo, analysis)
+
     if _has_repo_marker(new_prompt) or _has_english(new_prompt) or _has_colloquial(new_prompt):
         rewritten = rewrite_prompt_to_formal_chinese(llm, new_prompt, "新增需求提示词")
         new_prompt = rewritten if rewritten else _fallback_new_requirement_prompt()
 
-    # Final hard fallback if still invalid.
+    # Final fallback.
     if _has_repo_marker(debug_prompt) or _has_english(debug_prompt) or _has_colloquial(debug_prompt):
         debug_prompt = (
             _fallback_debug_prompt(results, debug_repo, analysis)
             if debug_repo
             else "7 个产物都很优秀，无法写 debug"
         )
-    if new_prompt and (
-        _has_repo_marker(new_prompt) or _has_english(new_prompt) or _has_colloquial(new_prompt)
-    ):
+    if new_prompt and (_has_repo_marker(new_prompt) or _has_english(new_prompt) or _has_colloquial(new_prompt)):
         new_prompt = _fallback_new_requirement_prompt()
 
     return AgentDecision(
@@ -398,11 +396,11 @@ def build_llm_input(
         "base_prompt": parsed.base_prompt,
         "rules": {
             "debug_select_priority": "优先选择有具体remark的repo；若无remark，再选0分；再选1分；debug只选1个repo",
-            "new_requirement_select": "新增需求改写repo只能选择2分repo；若没有2分repo必须留空",
-            "prompt_language": "debug_prompt和new_requirement_prompt必须是中文，不允许英文",
-            "prompt_content": "两段prompt文本里都不能出现repo编号",
-            "new_requirement_prompt": "必须是一个单一具体功能，不能笼统，且需包含明确验收标准",
-            "style": "提示词必须正式、客观、非口语化",
+            "new_requirement_select": "新增需求改写repo只能是2分repo；若无2分repo必须留空",
+            "prompt_language": "debug_prompt和new_requirement_prompt必须是中文",
+            "prompt_content": "两个prompt文本中禁止出现repo编号",
+            "style": "两个prompt必须正式、具体、非口语化",
+            "new_requirement_prompt": "新增需求必须是单一具体功能，且包含验收标准",
         },
         "global_extra_issues": analysis.global_issues,
         "cases": cases,
@@ -428,15 +426,15 @@ def call_llm(
         api_key=api_key,
         base_url=base_url,
     )
+
     system_prompt = (
-        "你是用于产出质检提示词的智能体。"
-        "你必须基于输入case信息输出JSON对象。"
+        "你是用于生成质检提示词的Agent。"
+        "你必须输出JSON对象。"
         "debug和新增需求各只选一个repo。"
-        "新增需求改写repo只能是2分repo；若不存在2分repo必须留空。"
-        "两个prompt必须是中文，且不能出现repo编号。"
-        "两个prompt必须正式、具体、非口语化。"
-        "新增需求prompt必须是单一具体功能，并给出可执行的验收标准。"
-        "请结合每个case的extra_issues和global_extra_issues分析是否还存在其他问题。"
+        "新增需求改写repo只能是2分repo；若无2分repo则留空。"
+        "两个prompt必须中文，不能出现repo编号，且风格正式、具体、非口语化。"
+        "新增需求prompt必须是单一具体功能，并给出验收标准。"
+        "请结合extra_issues与global_extra_issues分析是否存在额外问题。"
     )
     human_prompt = (
         "请根据以下输入生成JSON对象。"
@@ -508,6 +506,7 @@ def main() -> None:
     analysis = analyze_fetch_json(fetch_path)
     decision = call_llm(parsed, results, analysis)
     write_output_md(output_path, decision)
+
     print(f"Generated: {output_path}")
     print(f"Fetched: {fetch_path}")
 
