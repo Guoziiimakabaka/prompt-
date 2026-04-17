@@ -1,25 +1,22 @@
-﻿# Prompt 质检 Agent（Excel 版）
+﻿# Prompt 质检 Agent（Excel + 行为验证驱动版）
 
-## 功能概述
-该 Agent 从 `input.xlsx` 逐行读取数据，针对每行中的 7 个 repo 页面执行抓取与运行检查，再调用大模型生成：
-- `debug prompt`
-- `debug 改写repo`
-- `无法写debug改写备注`
-- `新增需求 prompt`
-- `新增需求改写 repo`
-- `无法新增需求备注`
+## 目标
+该 Agent 从 `input.xlsx` 逐行读取任务，针对每行的 7 个网页进行：
+1. 页面内容抓取
+2. Playwright 真实交互验证（行为驱动）
+3. LLM 生成 `debug prompt` 与 `新增需求 prompt`
+4. 结果直接回填到 Excel
 
-最后把结果直接回填到 Excel 对应行。
+---
 
-## 输入表结构（当前版本）
-当前代码依赖以下列名（第一行表头）：
+## 输入列（必须）
 - `uid`
 - `prompt`
-- `repo`（JSON 字符串，长度必须为 7）
-- `评分`（JSON 字符串，长度必须为 7，元素只能是 0/1/2）
-- `产物备注（参考）`（可为空，支持 `repo1：...` 形式）
+- `repo`（JSON 数组，长度必须 7）
+- `评分`（JSON 数组，长度必须 7，元素只能 0/1/2）
+- `产物备注（参考）`（可空，支持 `repo1: ...` 形式）
 
-输出回填列（不存在会自动新增）：
+## 输出列（自动写回）
 - `debug prompt`
 - `debug 改写repo`
 - `无法写debug改写备注`
@@ -27,61 +24,88 @@
 - `新增需求改写 repo`
 - `无法新增需求备注`
 
+---
+
 ## 核心流程
-1. 读取 Excel 指定 sheet。
-2. 校验输入列与每行数据结构。
-3. 解析每行：`prompt`、7个 URL、7个评分、remark。
-4. 对 7 个 URL 调用 `app.py` 的 `extract_page_content` 抓取页面文本。
-5. 使用 Playwright 对页面做运行检查（脚本报错、控制台错误、请求失败、空白渲染）。
-6. 组织结构化上下文给 LLM（LangChain ChatOpenAI）。
-7. 生成并校正决策（debug/new requirement 各选 1 个 repo）。
-8. 将结果回填到当前行并保存 Excel。
-9. 同时输出 `repo_fetch_results.json`（抓取+运行检查+决策详情）。
+1. 读取 Excel 与表头，解析输入列。
+2. 逐行解析 `prompt/repo/评分/备注`。
+3. 对 7 个 URL 执行静态内容抓取（标题、正文文本长度等）。
+4. 对 7 个 URL 执行行为验证（Playwright）：
+   - 页面加载与错误采集（pageerror / console error / requestfailed）
+   - 通用交互探测（真实 click，断言 DOM 状态变化）
+   - 表单探测（真实 fill，断言值变化）
+   - 棋盘类探测（识别 cell/square/tile 后真实点击，断言状态变化）
+5. 将行为验证结果作为主信号输入 LLM。
+6. 通过后置规则强校验结果并纠偏。
+7. 回填 Excel，并输出 `repo_fetch_results.json`（含行为证据）。
 
-## 关键约束（已固化）
-- Debug 选择优先级：
-  1) 优先有具体 remark 的 repo
-  2) 否则 0 分 repo
-  3) 再否则 1 分 repo
-- 新增需求改写 repo 只能从 `2分且运行检查通过` 的 repo 中选择。
-- 若无可用 2 分 repo：
-  - `新增需求改写 repo` 置空
-  - `新增需求 prompt` 置空
-  - `无法新增需求备注` 自动写明原因
-- 两个 prompt 会被强制约束为：
-  - 中文
-  - 正式、具体、非口语化
-  - 不出现 repo 编号和网址
+---
 
-## 网页 bug 判定规则
-当前采用“内容层 + 运行时层”双信号：
+## 行为验证如何判定“有问题”
+运行检查返回结构：
+- `checked`
+- `passed`
+- `issues`
+- `behavior_checked`
+- `behavior_passed`
+- `behavior_issues`
+- `behavior_evidence`
 
-内容层：
-- 抓取失败
-- 标题为空或默认 `React App`
-- 正文提取为空（`text_length == 0`）
+### 触发问题的典型条件
+- 页面接近空白（`#root` 未渲染且正文极短）
+- 出现脚本异常或 console error
+- 请求失败过多
+- 执行多次真实点击后页面状态仍无变化
+- 棋盘类场景中，多次点击候选落子单元后状态无变化
+- 表单可见但 fill 后值未变化
 
-运行时层（Playwright）：
-- `pageerror`（脚本异常）
-- console `error`
-- `requestfailed`（失败请求数过多）
-- `#root` 未渲染且正文接近空白
+说明：`behavior_evidence` 会记录探测动作和变化结果（如尝试次数、点击元素文本、状态变化次数），用于可追溯分析，而不是仅靠备注猜测。
 
-运行检查结果结构：
-- `checked`: 是否完成检查
-- `passed`: 是否通过（issues 为空）
-- `issues`: 具体问题
+---
+
+## 选取规则（已固化）
+### Debug repo
+优先级：
+1. 有行为问题且有具体备注
+2. 有行为问题且评分 0/1
+3. 有具体备注
+4. 0 分
+5. 1 分
+
+### 新增需求 repo
+只能从满足以下条件的 repo 中选：
+- 评分为 2
+- `runtime.checked = true`
+- `runtime.passed = true`
+- `runtime.behavior_checked = true`
+- `runtime.behavior_passed = true`
+
+若不存在满足条件的 2 分 repo，则新增需求置空并填写“无法新增需求备注”。
+
+---
+
+## Prompt 约束（后置校验）
+两个 prompt 都必须：
+- 中文
+- 正式、具体、非口语化
+- 不包含 repo 编号、网址、英文
+
+若 LLM 输出不合规，会自动改写；改写失败则使用内置 fallback。
+
+---
 
 ## 运行方式
 ```bash
 python workflow_agent.py --input_xlsx input.xlsx --sheet_name react
 ```
 
-可选参数：
-- `--output_xlsx output.xlsx`：输出到新文件（不覆盖原始文件）
-- `--uid 188978562750`：只处理指定 uid
-- `--start_row 2 --max_rows 1`：分批处理
-- `--fetch_json repo_fetch_results.json`：中间结果文件路径
+常用参数：
+- `--output_xlsx output.xlsx`：输出到新文件
+- `--uid 1207game-12402`：只处理指定 uid
+- `--start_row 2 --max_rows 1`：分批跑
+- `--fetch_json repo_fetch_results.json`：中间结果输出
+
+---
 
 ## 依赖
 - langchain
@@ -93,10 +117,12 @@ python workflow_agent.py --input_xlsx input.xlsx --sheet_name react
 - beautifulsoup4
 - python-dotenv
 
-首次使用 Playwright 需安装浏览器：
+首次运行 Playwright 需安装浏览器：
 ```bash
 python -m playwright install chromium
 ```
+
+---
 
 ## 环境变量（.env）
 - `MODEL_BASE_URL`
