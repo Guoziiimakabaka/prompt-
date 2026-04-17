@@ -1,287 +1,283 @@
 import argparse
 import json
-import os
+import re
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
 
-from dotenv import load_dotenv
-from openai import OpenAI
-from pydantic import BaseModel, Field, HttpUrl, ValidationError
-
-
-class AgentInput(BaseModel):
-    original_prompt: str = Field(..., min_length=1)
-    repo: list[HttpUrl] = Field(..., min_length=7, max_length=7)
-    scores: list[int] = Field(..., min_length=7, max_length=7)
-    score_notes: list[str] = Field(..., min_length=7, max_length=7)
-    manual_check: list[bool] = Field(
-        ...,
-        min_length=7,
-        max_length=7,
-        description="True means bug exists after manual check, False means no bug.",
-    )
-
-
-class AgentOutput(BaseModel):
-    debug_prompt: str
-    debug_rewrite_repo: str
-    new_requirement_prompt: str
-    new_requirement_rewrite_repo: str
-    unable_to_add_requirement_note: str
+from app import extract_page_content
 
 
 @dataclass
-class CaseRecord:
-    case_id: str
+class ParsedInput:
+    base_prompt: str
+    repo_urls: list[str]
+    scores: list[int]
+    remarks: dict[int, str]
+
+
+@dataclass
+class RepoResult:
+    repo_id: str
     url: str
     score: int
-    score_note: str
-    has_bug_after_manual_check: bool
+    remark: str
+    ok: bool
+    title: str
+    text_preview: str
+    text_length: int
+    error: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="One-workflow agent for debug prompt and new requirement prompt."
+        description="Parse input.md, fetch repo pages, and generate output.md."
     )
     parser.add_argument(
-        "--input_json",
-        default="",
-        help="Input JSON string with keys: original_prompt, repo, scores, score_notes, manual_check",
+        "--input_md",
+        default="input.md",
+        help="Input markdown path.",
     )
     parser.add_argument(
-        "--input_file",
-        default="",
-        help="Path to input JSON file. If provided, this takes precedence over --input_json.",
+        "--output_md",
+        default="output.md",
+        help="Output markdown path.",
     )
     parser.add_argument(
-        "--output_file",
-        default="agent_output.json",
-        help="Output JSON file path.",
+        "--fetch_json",
+        default="repo_fetch_results.json",
+        help="Fetched repo debug JSON path.",
     )
     return parser.parse_args()
 
 
-def build_case_records(payload: AgentInput) -> list[CaseRecord]:
-    cases: list[CaseRecord] = []
-    for idx in range(7):
-        case = CaseRecord(
-            case_id=f"repo{idx + 1}",
-            url=str(payload.repo[idx]),
-            score=payload.scores[idx],
-            score_note=payload.score_notes[idx],
-            has_bug_after_manual_check=payload.manual_check[idx],
-        )
-        cases.append(case)
-    return cases
+def _extract_json_arrays(text: str) -> list[list]:
+    arrays_raw = re.findall(r"\[[\s\S]*?\]", text)
+    arrays: list[list] = []
+    for raw in arrays_raw:
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list):
+            arrays.append(value)
+    return arrays
 
 
-def detect_prompt_abnormal(original_prompt: str) -> str:
-    text = original_prompt.strip()
-    if len(text) < 30:
-        return "原始需求可能过短，信息不足，存在需求缺失风险。"
+def parse_input_md(path: Path) -> ParsedInput:
+    text = path.read_text(encoding="utf-8")
 
-    abnormal_markers = [
-        "以下是一个游戏设计",
-        "从零开始",
+    base_match = re.search(r"base_prompt:\s*(.*?)\n---", text, re.S)
+    if base_match is None:
+        raise ValueError("Cannot parse base_prompt from input.md")
+    base_prompt = base_match.group(1).strip()
+
+    arrays = _extract_json_arrays(text)
+    repo_urls: list[str] | None = None
+    scores: list[int] | None = None
+    for arr in arrays:
+        if arr and all(isinstance(x, str) and x.startswith("http") for x in arr):
+            repo_urls = arr
+        elif arr and all(str(x) in {"0", "1", "2"} for x in arr):
+            scores = [int(x) for x in arr]
+
+    if repo_urls is None:
+        raise ValueError("Cannot parse repo url list from input.md")
+    if scores is None:
+        raise ValueError("Cannot parse score list from input.md")
+    if len(repo_urls) != 7 or len(scores) != 7:
+        raise ValueError("repo urls and scores must both have length 7")
+
+    remarks: dict[int, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        match = re.match(r"^repo(\d+)\W+(.+)$", stripped)
+        if match is None:
+            continue
+        idx = int(match.group(1))
+        note = match.group(2).strip()
+        if 1 <= idx <= 7 and note:
+            remarks[idx] = note
+
+    return ParsedInput(
+        base_prompt=base_prompt,
+        repo_urls=repo_urls,
+        scores=scores,
+        remarks=remarks,
+    )
+
+
+def fetch_repos(data: ParsedInput) -> list[RepoResult]:
+    results: list[RepoResult] = []
+    for i, url in enumerate(data.repo_urls, start=1):
+        repo_id = f"repo{i}"
+        score = data.scores[i - 1]
+        remark = data.remarks.get(i, "")
+        try:
+            extracted = extract_page_content(url)
+            text = extracted.get("text", "")
+            result = RepoResult(
+                repo_id=repo_id,
+                url=url,
+                score=score,
+                remark=remark,
+                ok=True,
+                title=extracted.get("title", ""),
+                text_preview=text[:220].replace("\n", " "),
+                text_length=int(extracted.get("text_length", 0)),
+                error="",
+            )
+        except Exception as exc:
+            result = RepoResult(
+                repo_id=repo_id,
+                url=url,
+                score=score,
+                remark=remark,
+                ok=False,
+                title="",
+                text_preview="",
+                text_length=0,
+                error=str(exc),
+            )
+        results.append(result)
+    return results
+
+
+def choose_debug_repo(results: list[RepoResult]) -> RepoResult | None:
+    with_remark = [
+        r for r in results if r.remark and r.score in (0, 1)
     ]
-    marker_hits = sum(1 for marker in abnormal_markers if marker in text)
-    if marker_hits == 0:
-        return "原始需求可能存在表述模糊，请人工复核需求完整性。"
-    return ""
+    if with_remark:
+        return with_remark[0]
 
-
-def choose_debug_case(cases: list[CaseRecord]) -> CaseRecord | None:
-    score_zero = [case for case in cases if case.score == 0]
+    score_zero = [r for r in results if r.score == 0]
     if score_zero:
         return score_zero[0]
 
-    score_one = [case for case in cases if case.score == 1]
+    score_one = [r for r in results if r.score == 1]
     if score_one:
         return score_one[0]
-
     return None
 
 
-def choose_new_requirement_case(cases: list[CaseRecord]) -> CaseRecord | None:
-    valid = [
-        case
-        for case in cases
-        if case.score == 2 and case.has_bug_after_manual_check is False
-    ]
-    if not valid:
-        return None
-    return valid[0]
+def choose_new_requirement_repo(results: list[RepoResult]) -> RepoResult | None:
+    score_two = [r for r in results if r.score == 2]
+    if score_two:
+        return score_two[0]
+    return None
 
 
-def build_debug_prompt_without_llm(case: CaseRecord) -> str:
+def build_debug_prompt(repo: RepoResult) -> str:
+    note = repo.remark if repo.remark else "存在交互或机制问题"
     return (
-        f"请帮我重点修复 {case.case_id} 这个静态网站。"
-        f"我实际打开后发现问题是：{case.score_note}。"
-        "请你先定位根因，再把问题修好。"
-        "修复要求：不要改坏已有可用功能，修完后请自查核心交互流程。"
+        f"请你帮我修复 `{repo.repo_id}` 这个版本。"
+        f"当前明显问题是：{note}。"
+        "请先定位根因，再完整修复。"
+        "修复时不要破坏已可用功能，修完后请你自测完整对局流程，"
+        "重点检查落子、boop 推挤、棋子回收和胜负判定。"
     )
 
 
-def build_new_requirement_prompt_without_llm(
-    original_prompt: str,
-    case: CaseRecord,
-) -> str:
+def build_new_requirement_prompt(repo: RepoResult) -> str:
     return (
-        f"当前 {case.case_id} 已通过检查，没有发现 bug。"
-        "请在不偏离原始需求的前提下继续增强功能，新增需求必须与当前产品核心场景强相关。"
-        "增强要求：保持现有交互逻辑一致，界面风格延续当前版本，新增功能完成后可直接在页面中体验。"
-        f"原始需求摘要：{original_prompt[:180]}"
+        f"请基于 `{repo.repo_id}` 增加一个和当前玩法强相关的增强功能，"
+        "但不要改变 Boop 的核心规则（6x6 棋盘、kitten 推挤、三 kitten 升 cat、三 cat 获胜）。"
+        "新增功能要求：提升策略可读性或可玩性，并且在页面里可以直接体验。"
+        "建议方向：落子结果预览、关键规则可视化提示、对局过程反馈优化。"
     )
 
 
-def create_llm_client() -> OpenAI:
-    base_url = os.getenv("MODEL_BASE_URL")
-    api_key = os.getenv("MODEL_API_KEY")
+def build_unable_note(results: list[RepoResult], new_repo: RepoResult | None) -> str:
+    if new_repo is not None:
+        return "无。已完成新增需求 repo 选择。"
 
-    if not base_url:
-        raise ValueError("MODEL_BASE_URL is missing in .env")
-    if not api_key:
-        raise ValueError("MODEL_API_KEY is missing in .env")
+    has_score_two = any(r.score == 2 for r in results)
+    if not has_score_two:
+        return "没有 2 分 case，无法新增需求。"
 
-    return OpenAI(base_url=base_url, api_key=api_key)
+    return "2 分 case 无法确认为可用状态，无法新增需求。"
 
 
-def llm_rewrite_prompt(
-    client: OpenAI,
-    model_name: str,
-    prompt_type: str,
-    draft_prompt: str,
-    original_prompt: str,
-    case: CaseRecord,
-    abnormal_note: str,
-) -> str:
-    system_prompt = (
-        "你是一个严谨的提示词优化助手。"
-        "请只输出最终中文提示词内容，不要输出解释。"
-    )
-
-    user_prompt = (
-        f"任务类型：{prompt_type}\n"
-        f"case_id：{case.case_id}\n"
-        f"case_url：{case.url}\n"
-        f"case_score：{case.score}\n"
-        f"case_note：{case.score_note}\n"
-        f"原始需求：{original_prompt}\n"
-        f"异常备注：{abnormal_note or '无'}\n"
-        f"初稿：{draft_prompt}\n\n"
-        "请将初稿改写为更口语化、具体、可执行的提示词。"
-    )
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+def write_fetch_json(path: Path, data: ParsedInput, results: list[RepoResult]) -> None:
+    payload = {
+        "base_prompt": data.base_prompt,
+        "repo_urls": data.repo_urls,
+        "scores": data.scores,
+        "remarks": data.remarks,
+        "results": [
+            {
+                "repo": r.repo_id,
+                "url": r.url,
+                "score": r.score,
+                "remark": r.remark,
+                "ok": r.ok,
+                "title": r.title,
+                "text_preview": r.text_preview,
+                "text_length": r.text_length,
+                "error": r.error,
+            }
+            for r in results
         ],
-        temperature=0.3,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_output_md(
+    path: Path,
+    debug_repo: RepoResult | None,
+    new_repo: RepoResult | None,
+    debug_prompt: str,
+    new_prompt: str,
+    unable_note: str,
+) -> None:
+    debug_repo_id = debug_repo.repo_id if debug_repo else ""
+    new_repo_id = new_repo.repo_id if new_repo else ""
+
+    content = (
+        "# 输出结果\n"
+        f"debug prompt:\n{debug_prompt}\n\n"
+        f"debug改写repo:\n{debug_repo_id}\n\n"
+        f"新增需求prompt:\n{new_prompt}\n\n"
+        f"新增需求改写repo:\n{new_repo_id}\n\n"
+        f"无法新增需求备注:\n{unable_note}\n"
     )
-    content = response.choices[0].message.content
-    if content is None or not content.strip():
-        raise ValueError("LLM returned empty content.")
-    return content.strip()
-
-
-def run_workflow(input_payload: dict[str, Any]) -> AgentOutput:
-    payload = AgentInput.model_validate(input_payload)
-    for score in payload.scores:
-        if score not in (0, 1, 2):
-            raise ValueError("scores only allow 0/1/2")
-
-    cases = build_case_records(payload)
-    abnormal_note = detect_prompt_abnormal(payload.original_prompt)
-
-    debug_case = choose_debug_case(cases)
-    new_case = choose_new_requirement_case(cases)
-
-    load_dotenv()
-    model_name = os.getenv("MODEL_NAME")
-    if not model_name:
-        raise ValueError("MODEL_NAME is missing in .env")
-
-    client = create_llm_client()
-
-    if debug_case is None:
-        debug_prompt = "7 个产物都很优秀，无法写 debug"
-        debug_repo = ""
-    else:
-        debug_draft = build_debug_prompt_without_llm(debug_case)
-        debug_prompt = llm_rewrite_prompt(
-            client=client,
-            model_name=model_name,
-            prompt_type="debug",
-            draft_prompt=debug_draft,
-            original_prompt=payload.original_prompt,
-            case=debug_case,
-            abnormal_note=abnormal_note,
-        )
-        debug_repo = debug_case.case_id
-
-    if new_case is None:
-        new_requirement_prompt = ""
-        new_requirement_repo = ""
-        score2_cases = [case for case in cases if case.score == 2]
-        if not score2_cases:
-            unable_note = "没有可用的 2 分 case，无法写新增需求。"
-        else:
-            unable_note = "所有 2 分 case 在实际检查后仍存在 bug，无法新增需求。"
-    else:
-        new_draft = build_new_requirement_prompt_without_llm(
-            original_prompt=payload.original_prompt,
-            case=new_case,
-        )
-        new_requirement_prompt = llm_rewrite_prompt(
-            client=client,
-            model_name=model_name,
-            prompt_type="new_requirement",
-            draft_prompt=new_draft,
-            original_prompt=payload.original_prompt,
-            case=new_case,
-            abnormal_note=abnormal_note,
-        )
-        new_requirement_repo = new_case.case_id
-        unable_note = ""
-
-    if abnormal_note:
-        suffix = (
-            " 原始需求疑似异常，请人工复核。"
-            "若异常影响理解，请在对应 case 标注异常来源。"
-        )
-        if unable_note:
-            unable_note = f"{unable_note} {suffix}"
-        else:
-            unable_note = suffix
-
-    return AgentOutput(
-        debug_prompt=debug_prompt,
-        debug_rewrite_repo=debug_repo,
-        new_requirement_prompt=new_requirement_prompt,
-        new_requirement_rewrite_repo=new_requirement_repo,
-        unable_to_add_requirement_note=unable_note,
-    )
+    path.write_text(content, encoding="utf-8")
 
 
 def main() -> None:
     args = parse_args()
-    if args.input_file:
-        with open(args.input_file, "r", encoding="utf-8-sig") as file:
-            input_payload = json.load(file)
-    else:
-        if not args.input_json:
-            raise ValueError("Either --input_file or --input_json must be provided.")
-        try:
-            input_payload = json.loads(args.input_json)
-        except json.JSONDecodeError as exc:
-            raise ValueError("input_json is not valid JSON string") from exc
+    input_path = Path(args.input_md)
+    output_path = Path(args.output_md)
+    fetch_path = Path(args.fetch_json)
 
-    result = run_workflow(input_payload)
-    with open(args.output_file, "w", encoding="utf-8") as file:
-        json.dump(result.model_dump(), file, ensure_ascii=False, indent=2)
-    print(json.dumps(result.model_dump(), ensure_ascii=False, indent=2))
+    parsed = parse_input_md(input_path)
+    results = fetch_repos(parsed)
+    write_fetch_json(fetch_path, parsed, results)
+
+    debug_repo = choose_debug_repo(results)
+    new_repo = choose_new_requirement_repo(results)
+
+    if debug_repo is None:
+        debug_prompt = "7 个产物都很优秀，无法写 debug"
+    else:
+        debug_prompt = build_debug_prompt(debug_repo)
+
+    if new_repo is None:
+        new_prompt = ""
+    else:
+        new_prompt = build_new_requirement_prompt(new_repo)
+
+    unable_note = build_unable_note(results, new_repo)
+
+    write_output_md(
+        output_path,
+        debug_repo,
+        new_repo,
+        debug_prompt,
+        new_prompt,
+        unable_note,
+    )
+    print(f"Generated: {output_path}")
+    print(f"Fetched: {fetch_path}")
 
 
 if __name__ == "__main__":
