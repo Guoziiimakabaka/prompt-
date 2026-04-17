@@ -4,7 +4,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup, UnicodeDammit
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 from readability import Document
 
 
@@ -18,6 +18,16 @@ USER_AGENT = (
 
 class ExtractRequest(BaseModel):
     url: HttpUrl
+
+
+class IndexedExtractRequest(BaseModel):
+    urls: list[HttpUrl] = Field(
+        ...,
+        min_length=7,
+        max_length=7,
+        description="Exactly 7 URLs.",
+    )
+    index: int = Field(..., ge=1, le=7, description="Target URL position (1-7).")
 
 
 app = FastAPI(title="Static Web Extractor", version="0.1.0")
@@ -62,3 +72,18 @@ def extract(payload: ExtractRequest) -> dict[str, Any]:
         return extract_page_content(str(payload.url))
     except requests.RequestException as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/extract_by_index")
+def extract_by_index(payload: IndexedExtractRequest) -> dict[str, Any]:
+    selected_url = str(payload.urls[payload.index - 1])
+    try:
+        result = extract_page_content(selected_url)
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return {
+        "index": payload.index,
+        "selected_url": selected_url,
+        "result": result,
+    }
