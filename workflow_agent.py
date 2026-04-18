@@ -70,6 +70,8 @@ class RuntimeCheck:
     behavior_passed: bool
     behavior_issues: list[str]
     behavior_evidence: list[dict[str, Any]]
+    remark_probe_checked: bool
+    remark_related_issues: list[str]
 
 
 @dataclass
@@ -558,7 +560,76 @@ def _run_board_probe(page: Any, base_prompt: str) -> tuple[list[str], dict[str, 
     return issues, evidence
 
 
-def run_runtime_check(repo_id: str, url: str, base_prompt: str) -> RuntimeCheck:
+def _classify_remark_tokens(remark: str) -> dict[str, bool]:
+    text = remark.lower()
+    return {
+        "title_or_template": bool(
+            re.search(r"标题|react app|模板|template|title|页签|tab", text)
+        ),
+        "icon_or_style": bool(
+            re.search(r"图标|icon|样式|布局|丑|美观|未分开|混淆", text)
+        ),
+        "interaction_or_mechanic": bool(
+            re.search(r"机制|规则|交互|点击|卡死|死局|无法|回收|胜利|连线|落子", text)
+        ),
+        "progress_or_step": bool(
+            re.search(r"进度|步骤|stage|flow|流程", text)
+        ),
+    }
+
+
+def _probe_remark_specific_issues(
+    remark: str,
+    title: str,
+    page_errors: list[str],
+    console_errors: list[str],
+    behavior_issues: list[str],
+    behavior_evidence: list[dict[str, Any]],
+) -> tuple[list[str], dict[str, Any]]:
+    if not _is_meaningful_remark(remark):
+        return [], {"skipped": True}
+
+    tags = _classify_remark_tokens(remark)
+    issues: list[str] = []
+    evidence: dict[str, Any] = {
+        "probe": "remark_directed",
+        "remark": remark[:200],
+        "tags": tags,
+    }
+
+    if tags["title_or_template"] and title.strip().strip('"') in {"", "React App"}:
+        issues.append("备注涉及标题/模板问题，实测页面标题仍为默认模板或为空。")
+
+    if tags["progress_or_step"]:
+        generic_probe = next(
+            (item for item in behavior_evidence if item.get("probe") == "generic_interaction"),
+            {},
+        )
+        attempts = int(generic_probe.get("attempts", 0))
+        changes = int(generic_probe.get("state_changes", 0))
+        evidence["progress_probe"] = {"attempts": attempts, "state_changes": changes}
+        if attempts > 0 and changes == 0:
+            issues.append("备注涉及流程/进度问题，实测多次交互后流程状态无变化。")
+
+    if tags["interaction_or_mechanic"]:
+        if behavior_issues:
+            issues.append("备注涉及机制/交互问题，实测行为探测出现可复现异常。")
+        if page_errors or console_errors:
+            issues.append("备注涉及机制/交互问题，实测存在脚本或控制台错误。")
+
+    if tags["icon_or_style"]:
+        # 对视觉类问题仅在存在可观测异常时给出可确认结论，不做主观评价。
+        if page_errors or console_errors:
+            issues.append("备注涉及视觉表现问题，实测存在前端错误，可能导致界面呈现异常。")
+
+    deduped: list[str] = []
+    for item in issues:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped, evidence
+
+
+def run_runtime_check(repo_id: str, url: str, base_prompt: str, remark: str) -> RuntimeCheck:
     try:
         from playwright.sync_api import sync_playwright
     except Exception as exc:
@@ -572,6 +643,8 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str) -> RuntimeCheck:
             behavior_passed=False,
             behavior_issues=[missing],
             behavior_evidence=[],
+            remark_probe_checked=False,
+            remark_related_issues=[],
         )
 
     page_errors: list[str] = []
@@ -580,6 +653,8 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str) -> RuntimeCheck:
     health_issues: list[str] = []
     behavior_issues: list[str] = []
     behavior_evidence: list[dict[str, Any]] = []
+    remark_related_issues: list[str] = []
+    remark_probe_checked = False
 
     try:
         with sync_playwright() as p:
@@ -636,6 +711,18 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str) -> RuntimeCheck:
             behavior_issues.extend(board_issues)
             behavior_evidence.append(board_evidence)
 
+            directed_issues, directed_evidence = _probe_remark_specific_issues(
+                remark=remark,
+                title=page.title(),
+                page_errors=page_errors,
+                console_errors=console_errors,
+                behavior_issues=behavior_issues,
+                behavior_evidence=behavior_evidence,
+            )
+            remark_related_issues.extend(directed_issues)
+            behavior_evidence.append(directed_evidence)
+            remark_probe_checked = not directed_evidence.get("skipped", False)
+
             context.close()
             browser.close()
     except Exception as exc:
@@ -649,9 +736,11 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str) -> RuntimeCheck:
             behavior_passed=False,
             behavior_issues=[err],
             behavior_evidence=behavior_evidence,
+            remark_probe_checked=remark_probe_checked,
+            remark_related_issues=remark_related_issues,
         )
 
-    all_issues = health_issues + behavior_issues
+    all_issues = health_issues + behavior_issues + remark_related_issues
     return RuntimeCheck(
         repo_id=repo_id,
         checked=True,
@@ -661,6 +750,8 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str) -> RuntimeCheck:
         behavior_passed=not behavior_issues,
         behavior_issues=behavior_issues,
         behavior_evidence=behavior_evidence,
+        remark_probe_checked=remark_probe_checked,
+        remark_related_issues=remark_related_issues,
     )
 
 
@@ -685,7 +776,7 @@ def build_analysis(results: list[RepoResult], base_prompt: str) -> AnalysisBundl
         if result.text_length == 0:
             empty_text.append(result.repo_id)
 
-        runtime = run_runtime_check(result.repo_id, result.url, base_prompt)
+        runtime = run_runtime_check(result.repo_id, result.url, base_prompt, result.remark)
         runtime_checks[result.repo_id] = runtime
         if not runtime.passed:
             issues.extend(runtime.issues)
@@ -755,30 +846,49 @@ def _has_runtime_bug(repo_id: str, analysis: AnalysisBundle) -> bool:
     return bool(runtime and runtime.checked and (not runtime.passed))
 
 
+def _verified_bug_lines(repo: RepoResult, analysis: AnalysisBundle) -> list[str]:
+    runtime = analysis.runtime_checks.get(repo.repo_id)
+    lines: list[str] = []
+    if runtime:
+        for item in runtime.remark_related_issues:
+            text = _to_text(item)
+            if text and text not in lines:
+                lines.append(text)
+        for item in runtime.behavior_issues:
+            text = _to_text(item)
+            if text and text not in lines:
+                lines.append(text)
+        for item in runtime.issues:
+            text = _to_text(item)
+            if text and text not in lines:
+                lines.append(text)
+    for item in analysis.repo_issues.get(repo.repo_id, []):
+        text = _to_text(item)
+        if text and text not in lines:
+            lines.append(text)
+    return lines
+
+
 def _fallback_debug_prompt(
     results: list[RepoResult],
     debug_repo: str,
     analysis: AnalysisBundle,
 ) -> str:
     selected = _repo_by_id(debug_repo, results)
-    note = selected.remark.strip() if selected else ""
-    runtime = analysis.runtime_checks.get(debug_repo)
-    runtime_part = "；".join(runtime.behavior_issues[:2]) if runtime else ""
+    if selected is None:
+        return DEBUG_UNABLE_TEXT
 
-    raw_issue_part = analysis.repo_issues.get(debug_repo, [])
-    filtered_issue_part = [
-        item
-        for item in raw_issue_part
-        if "正文提取为空，可能依赖前端渲染" not in item
-    ]
-    issue_part = "；".join(filtered_issue_part[:2])
+    verified = _verified_bug_lines(selected, analysis)
+    if not verified:
+        return DEBUG_UNABLE_TEXT
 
-    chunks = [chunk for chunk in [note, runtime_part, issue_part] if chunk]
-    summary = "；".join(chunks) if chunks else "当前实现存在行为与规则判定不一致问题"
+    top_lines = verified[:3]
+    line_text = "；".join(top_lines)
     return (
-        f"请修复当前页面中的关键缺陷：{summary}。"
-        "请先给出最小复现步骤，再提供根因分析与修复方案。"
-        "修复后请给出覆盖正常流程与边界场景的回归验证结果。"
+        "请基于以下已验证缺陷进行修复："
+        f"{line_text}。"
+        "请逐条给出对应的最小复现步骤、根因分析和修复方案，"
+        "并提供同路径回归验证结果。"
     )
 
 
@@ -793,7 +903,11 @@ def _fallback_new_requirement_prompt() -> str:
 
 def _pick_debug_repo(results: list[RepoResult], analysis: AnalysisBundle) -> str:
     ordered = _sort_repos(results)
-    bug_repos = [r for r in ordered if _has_runtime_bug(r.repo_id, analysis)]
+    bug_repos = [
+        r
+        for r in ordered
+        if _has_runtime_bug(r.repo_id, analysis) and _verified_bug_lines(r, analysis)
+    ]
     bug_with_remark = [r for r in bug_repos if _is_meaningful_remark(r.remark)]
     if bug_with_remark:
         return bug_with_remark[0].repo_id
@@ -802,15 +916,17 @@ def _pick_debug_repo(results: list[RepoResult], analysis: AnalysisBundle) -> str
     if bug_score01:
         return bug_score01[0].repo_id
 
-    remark_repos = [r for r in ordered if _is_meaningful_remark(r.remark)]
+    remark_repos = [
+        r for r in ordered if _is_meaningful_remark(r.remark) and _verified_bug_lines(r, analysis)
+    ]
     if remark_repos:
         return remark_repos[0].repo_id
 
-    score0 = [r for r in ordered if r.score == 0]
+    score0 = [r for r in ordered if r.score == 0 and _verified_bug_lines(r, analysis)]
     if score0:
         return score0[0].repo_id
 
-    score1 = [r for r in ordered if r.score == 1]
+    score1 = [r for r in ordered if r.score == 1 and _verified_bug_lines(r, analysis)]
     if score1:
         return score1[0].repo_id
     return ""
@@ -902,14 +1018,18 @@ def validate_and_fix_decision(
         new_repo = eligible_score2[0] if eligible_score2 else ""
 
     debug_prompt = decision.debug_prompt.strip()
+    selected_debug_obj = _repo_by_id(debug_repo, results) if debug_repo else None
+    selected_verified = (
+        _verified_bug_lines(selected_debug_obj, analysis) if selected_debug_obj else []
+    )
     if not debug_prompt:
         debug_prompt = (
             _fallback_debug_prompt(results, debug_repo, analysis)
             if debug_repo
             else DEBUG_UNABLE_TEXT
         )
-    if not debug_repo:
-        # 没有选中 debug 对象时，必须明确输出“无法写 debug”，避免出现无对象 prompt。
+    if not debug_repo or not selected_verified:
+        # 没有可验证缺陷时，禁止生成猜测型 debug prompt。
         debug_prompt = DEBUG_UNABLE_TEXT
 
     new_prompt = decision.new_requirement_prompt.strip()
@@ -960,6 +1080,8 @@ def _behavior_summary(runtime: RuntimeCheck | None) -> dict[str, Any]:
         "behavior_passed": runtime.behavior_passed,
         "behavior_issue_count": len(runtime.behavior_issues),
         "behavior_issues": runtime.behavior_issues,
+        "remark_probe_checked": runtime.remark_probe_checked,
+        "remark_related_issues": runtime.remark_related_issues,
         "behavior_evidence": evidence,
     }
 
@@ -988,6 +1110,7 @@ def build_llm_input(
                 "runtime_passed": runtime.passed if runtime else False,
                 "runtime_issues": runtime.issues if runtime else [],
                 "behavior": _behavior_summary(runtime),
+                "verified_bug_lines": _verified_bug_lines(result, analysis),
             }
         )
 
@@ -996,11 +1119,11 @@ def build_llm_input(
         "base_prompt": parsed.base_prompt,
         "rules": {
             "selection_core": (
-                "优先基于行为验证结果选择debug对象；"
-                "在行为问题候选中，优先有具体remark的repo。"
+                "debug 只能基于已验证缺陷输出；"
+                "先做备注定向验错，再做通用行为探测。"
             ),
             "debug_select_priority": (
-                "有行为问题+有remark > 有行为问题且0/1分 > 有remark > 0分 > 1分。"
+                "有已验证缺陷+有remark > 有已验证缺陷且0/1分 > 其余有已验证缺陷。"
             ),
             "new_requirement_select": (
                 "新增需求改写repo只能选择2分且运行与行为验证均通过的repo。"
@@ -1008,6 +1131,7 @@ def build_llm_input(
             "prompt_style": "两个prompt必须中文、正式、具体、非口语化。",
             "prompt_forbidden": "两个prompt中不得出现repo编号、网址、英文。",
             "new_requirement_constraint": "新增需求必须是单一具体功能，且包含验收标准。",
+            "debug_constraint": "debug_prompt不得描述未验证问题，只能使用verified_bug_lines。",
         },
         "global_extra_issues": analysis.global_issues,
         "cases": cases,
@@ -1036,6 +1160,8 @@ def decide_for_case(
         "你是用于生成质检提示词的Agent。"
         "必须输出JSON对象。"
         "请以行为验证结论为主要依据，评分和备注仅作辅助。"
+        "debug_prompt只能基于已验证缺陷（verified_bug_lines、remark_related_issues、behavior_issues）生成。"
+        "不得描述未验证或推测性问题。"
         "debug与新增需求各只选一个repo。"
         "新增需求改写repo只能从“2分且运行与行为验证均通过”的repo中选择；"
         "若无可选项必须留空并写明原因。"
