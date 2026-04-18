@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -14,6 +15,8 @@ from langchain_openai import ChatOpenAI
 from openpyxl import load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from pydantic import BaseModel, Field
+import requests
+from bs4 import BeautifulSoup
 
 from app import extract_page_content
 
@@ -36,6 +39,12 @@ OUTPUT_COLUMNS: dict[str, str] = {
 }
 
 DEBUG_UNABLE_TEXT = "7 个产物都很优秀，无法写 debug"
+STATIC_FETCH_TIMEOUT = 15
+STATIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 @dataclass
@@ -72,6 +81,9 @@ class RuntimeCheck:
     behavior_evidence: list[dict[str, Any]]
     remark_probe_checked: bool
     remark_related_issues: list[str]
+    static_checked: bool
+    static_logic_issues: list[str]
+    static_evidence: dict[str, Any]
 
 
 @dataclass
@@ -629,6 +641,156 @@ def _probe_remark_specific_issues(
     return deduped, evidence
 
 
+def _extract_script_urls(page_url: str, html: str) -> list[str]:
+    soup = BeautifulSoup(html, "lxml")
+    urls: list[str] = []
+    for script in soup.find_all("script"):
+        src = script.get("src")
+        if not src:
+            continue
+        full = urljoin(page_url, str(src))
+        if full not in urls:
+            urls.append(full)
+    return urls
+
+
+def _fetch_text(url: str) -> str:
+    headers = {"User-Agent": STATIC_USER_AGENT}
+    resp = requests.get(url, headers=headers, timeout=STATIC_FETCH_TIMEOUT)
+    resp.raise_for_status()
+    return resp.text
+
+
+def _is_probably_minified(js: str) -> bool:
+    lines = js.splitlines()
+    if not lines:
+        return False
+    long_lines = sum(1 for line in lines if len(line) > 400)
+    return long_lines / max(len(lines), 1) > 0.2
+
+
+def _static_rule_token_scan(js_text: str, base_prompt: str) -> tuple[list[str], dict[str, Any]]:
+    issues: list[str] = []
+    evidence: dict[str, Any] = {}
+    lower_js = js_text.lower()
+    is_board_scene = bool(
+        re.search(
+            r"boop|kitten|kittens|cats|board|6x6|棋盘|落子|胜负|回合",
+            base_prompt,
+            re.IGNORECASE,
+        )
+    )
+    if not is_board_scene:
+        return issues, evidence
+
+    win_tokens = len(re.findall(r"win|victory|胜利|winner", lower_js))
+    cat_tokens = len(re.findall(r"cat|cats|猫", lower_js))
+    kitten_tokens = len(re.findall(r"kitten|kittens|小猫", lower_js))
+    push_tokens = len(re.findall(r"push|boop|挤|推", lower_js))
+    line_tokens = len(re.findall(r"line|row|连线|three|3", lower_js))
+
+    evidence.update(
+        {
+            "win_tokens": win_tokens,
+            "cat_tokens": cat_tokens,
+            "kitten_tokens": kitten_tokens,
+            "push_tokens": push_tokens,
+            "line_tokens": line_tokens,
+        }
+    )
+
+    # 针对 boop 类规则的静态逻辑信号（仅作为“疑似逻辑缺陷”）
+    if kitten_tokens > 0 and cat_tokens == 0:
+        issues.append("静态代码信号显示仅存在小猫相关状态，未识别猫阶段逻辑。")
+    if push_tokens == 0 and is_board_scene:
+        issues.append("静态代码未识别推动/挤出相关逻辑信号，疑似缺失核心规则实现。")
+    if win_tokens > 0 and line_tokens == 0:
+        issues.append("静态代码存在胜利判定入口，但未识别连线条件信号。")
+
+    return issues, evidence
+
+
+def _remark_targeted_static_scan(remark: str, js_text: str) -> list[str]:
+    if not _is_meaningful_remark(remark):
+        return []
+    text = remark.lower()
+    js = js_text.lower()
+    issues: list[str] = []
+
+    if re.search(r"标题|react app|模板|title", text):
+        if "react app" in js and "document.title" not in js:
+            issues.append("备注指向标题问题，静态代码未识别自定义标题写入逻辑。")
+
+    if re.search(r"进度|步骤|stage|流程", text):
+        progress_tokens = len(re.findall(r"progress|step|stage|阶段|流程", js))
+        if progress_tokens == 0:
+            issues.append("备注指向进度流程问题，静态代码未识别进度状态字段。")
+
+    if re.search(r"机制|规则|胜利|连线|回收|卡死|死局|落子", text):
+        state_tokens = len(re.findall(r"useState|reducer|state|dispatch|set[a-zA-Z]+", js))
+        if state_tokens == 0:
+            issues.append("备注指向机制问题，静态代码未识别明确状态更新链路。")
+
+    deduped: list[str] = []
+    for item in issues:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def run_static_logic_check(url: str, base_prompt: str, remark: str) -> tuple[list[str], dict[str, Any]]:
+    issues: list[str] = []
+    evidence: dict[str, Any] = {
+        "checked": False,
+        "script_count": 0,
+        "script_samples": [],
+        "source_map_detected": False,
+        "minified_scripts": 0,
+    }
+    try:
+        html = _fetch_text(url)
+        script_urls = _extract_script_urls(url, html)
+        evidence["checked"] = True
+        evidence["script_count"] = len(script_urls)
+        evidence["script_samples"] = script_urls[:5]
+        if not script_urls:
+            issues.append("静态解析未发现外部脚本资源，无法进行代码逻辑检查。")
+            return issues, evidence
+
+        merged_js_parts: list[str] = []
+        for script_url in script_urls[:6]:
+            try:
+                js_text = _fetch_text(script_url)
+            except Exception:
+                continue
+            merged_js_parts.append(js_text[:300000])
+            if "sourceMappingURL=" in js_text:
+                evidence["source_map_detected"] = True
+            if _is_probably_minified(js_text):
+                evidence["minified_scripts"] += 1
+
+        if not merged_js_parts:
+            issues.append("静态解析未获取到可用脚本文本。")
+            return issues, evidence
+
+        merged_js = "\n".join(merged_js_parts)
+        token_issues, token_evidence = _static_rule_token_scan(merged_js, base_prompt)
+        issues.extend(token_issues)
+        evidence["rule_token_scan"] = token_evidence
+
+        issues.extend(_remark_targeted_static_scan(remark, merged_js))
+    except Exception as exc:
+        issues.append(f"静态代码检查执行失败：{exc}")
+        evidence["checked"] = False
+
+    deduped: list[str] = []
+    for item in issues:
+        text = _to_text(item)
+        if text and text not in deduped:
+            deduped.append(text)
+    return deduped, evidence
+
+
 def run_runtime_check(repo_id: str, url: str, base_prompt: str, remark: str) -> RuntimeCheck:
     try:
         from playwright.sync_api import sync_playwright
@@ -645,6 +807,9 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str, remark: str) -> 
             behavior_evidence=[],
             remark_probe_checked=False,
             remark_related_issues=[],
+            static_checked=False,
+            static_logic_issues=[],
+            static_evidence={},
         )
 
     page_errors: list[str] = []
@@ -655,6 +820,11 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str, remark: str) -> 
     behavior_evidence: list[dict[str, Any]] = []
     remark_related_issues: list[str] = []
     remark_probe_checked = False
+    static_logic_issues, static_evidence = run_static_logic_check(
+        url=url,
+        base_prompt=base_prompt,
+        remark=remark,
+    )
 
     try:
         with sync_playwright() as p:
@@ -738,9 +908,12 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str, remark: str) -> 
             behavior_evidence=behavior_evidence,
             remark_probe_checked=remark_probe_checked,
             remark_related_issues=remark_related_issues,
+            static_checked=bool(static_evidence.get("checked", False)),
+            static_logic_issues=static_logic_issues,
+            static_evidence=static_evidence,
         )
 
-    all_issues = health_issues + behavior_issues + remark_related_issues
+    all_issues = health_issues + behavior_issues + remark_related_issues + static_logic_issues
     return RuntimeCheck(
         repo_id=repo_id,
         checked=True,
@@ -752,6 +925,9 @@ def run_runtime_check(repo_id: str, url: str, base_prompt: str, remark: str) -> 
         behavior_evidence=behavior_evidence,
         remark_probe_checked=remark_probe_checked,
         remark_related_issues=remark_related_issues,
+        static_checked=bool(static_evidence.get("checked", False)),
+        static_logic_issues=static_logic_issues,
+        static_evidence=static_evidence,
     )
 
 
@@ -850,6 +1026,10 @@ def _verified_bug_lines(repo: RepoResult, analysis: AnalysisBundle) -> list[str]
     runtime = analysis.runtime_checks.get(repo.repo_id)
     lines: list[str] = []
     if runtime:
+        for item in runtime.static_logic_issues:
+            text = _to_text(item)
+            if text and text not in lines:
+                lines.append(text)
         for item in runtime.remark_related_issues:
             text = _to_text(item)
             if text and text not in lines:
@@ -1082,6 +1262,9 @@ def _behavior_summary(runtime: RuntimeCheck | None) -> dict[str, Any]:
         "behavior_issues": runtime.behavior_issues,
         "remark_probe_checked": runtime.remark_probe_checked,
         "remark_related_issues": runtime.remark_related_issues,
+        "static_checked": runtime.static_checked,
+        "static_logic_issues": runtime.static_logic_issues,
+        "static_evidence": runtime.static_evidence,
         "behavior_evidence": evidence,
     }
 
@@ -1120,7 +1303,7 @@ def build_llm_input(
         "rules": {
             "selection_core": (
                 "debug 只能基于已验证缺陷输出；"
-                "先做备注定向验错，再做通用行为探测。"
+                "先做备注定向验错，再做通用行为探测与静态代码逻辑扫描。"
             ),
             "debug_select_priority": (
                 "有已验证缺陷+有remark > 有已验证缺陷且0/1分 > 其余有已验证缺陷。"
